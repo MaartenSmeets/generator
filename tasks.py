@@ -9,7 +9,7 @@ from nltk.sentiment import SentimentIntensityAnalyzer
 import spacy
 import pytesseract
 from PIL import Image
-from googletrans import Translator
+from translate import Translator
 from rake_nltk import Rake
 import subprocess
 from llm_utils import send_llm_request
@@ -24,7 +24,14 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 import time
-
+from omniparser.utils import get_som_labeled_img, check_ocr_box, get_caption_model_processor, get_yolo_model
+import torch
+from ultralytics import YOLO
+from PIL import Image
+device = 'cuda'
+som_model = get_yolo_model(model_path='omniparser/weights/icon_detect/best.pt')
+som_model.to(device)
+caption_model_processor = get_caption_model_processor(model_name="florence2", model_name_or_path="omniparser/weights/icon_caption_florence", device=device)
 logger = logging.getLogger(__name__)
 
 # Download NLTK resources automatically if they are missing
@@ -169,24 +176,28 @@ def extract_content(task_params, cache=None):
         # Capture a screenshot of the webpage
         screenshot = capture_screenshot(url)
 
+        draw_bbox_config = {
+            'text_scale': 0.8,
+            'text_thickness': 2,
+            'text_padding': 3,
+            'thickness': 3,
+        }
+        BOX_TRESHOLD = 0.03
+
         # Load the screenshot image
         image = Image.open(BytesIO(screenshot))
+        image_rgb = image.convert('RGB')
 
-        # Download and load the OmniParser model and processor
-        model_repo = "microsoft/OmniParser"
-        processor = BlipProcessor.from_pretrained(model_repo)
-        model = BlipForConditionalGeneration.from_pretrained(model_repo)
+        ocr_bbox_rslt, is_goal_filtered = check_ocr_box(image_path, display_img = False, output_bb_format='xyxy', goal_filtering=None, easyocr_args={'paragraph': False, 'text_threshold':0.9}, use_paddleocr=True)
+        text, ocr_bbox = ocr_bbox_rslt
 
-        # Preprocess the image
-        inputs = processor(images=image, return_tensors="pt")
+        dino_labled_img, label_coordinates, parsed_content_list = get_som_labeled_img(image_path, som_model, BOX_TRESHOLD = BOX_TRESHOLD, output_coord_in_ratio=False, ocr_bbox=ocr_bbox,draw_bbox_config=draw_bbox_config, caption_model_processor=caption_model_processor, ocr_text=text,use_local_semantics=True, iou_threshold=0.1)
 
-        # Generate structured data
-        outputs = model.generate(**inputs)
-        structured_data = processor.decode(outputs[0], skip_special_tokens=True)
-
-        return {'structured_data': structured_data}
+        return {'structured_data': parsed_content_list}
     except requests.RequestException as e:
         return {'error': str(e)}
+    except Exception as e:
+        return {'error': f"Parsing failed with OmniParser: {str(e)}"}
 TASK_FUNCTIONS["extract_content"] = extract_content
 
 def capture_screenshot(url):
@@ -206,7 +217,7 @@ def capture_screenshot(url):
         driver.get(url)
 
         # Allow time for the page to load completely
-        time.sleep(2)  # Adjust sleep time as necessary
+        time.sleep(3)  # Adjust sleep time as necessary
 
         # Calculate the total height of the page
         total_height = driver.execute_script("return document.body.scrollHeight")
@@ -215,7 +226,7 @@ def capture_screenshot(url):
         driver.set_window_size(1920, total_height)
 
         # Allow time for the window size adjustment
-        time.sleep(5)  # Adjust sleep time as necessary
+        time.sleep(3)  # Adjust sleep time as necessary
 
         # Capture the screenshot
         screenshot = driver.get_screenshot_as_png()
@@ -331,9 +342,19 @@ TASK_FUNCTIONS["extract_text_from_image"] = extract_text_from_image
 def translate_text(task_params, cache=None):
     text = task_params.get('text')
     language = task_params.get('language')
-    translator = Translator()
-    translation = translator.translate(text, dest=language)
-    return {"translated_text": translation.text}
+
+    if not text:
+        return {"error": "No text provided for translation."}
+    if not language:
+        return {"error": "No target language specified for translation."}
+
+    try:
+        translator = Translator(to_lang=language)
+        translated_text = translator.translate(text)
+        return {"translated_text": translated_text}
+    except Exception as e:
+        return {"error": f"Translation failed: {str(e)}"}
+
 TASK_FUNCTIONS["translate_text"] = translate_text
 
 def parse_json(task_params, cache=None):
