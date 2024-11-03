@@ -14,6 +14,16 @@ from rake_nltk import Rake
 import subprocess
 from llm_utils import send_llm_request
 import logging
+from PIL import Image
+from io import BytesIO
+import torch
+from transformers import BlipProcessor, BlipForConditionalGeneration
+from huggingface_hub import hf_hub_download
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -155,15 +165,65 @@ def extract_content(task_params, cache=None):
     try:
         response = requests.get(url, headers=headers)
         response.raise_for_status()
-        # Parse the HTML content using BeautifulSoup
-        soup = BeautifulSoup(response.text, 'html.parser')
-        # Extract text from the page
-        texts = soup.find_all(text=True)
-        page_content = ' '.join(text.strip() for text in texts if text.strip())
-        return {'page_content': page_content}
+
+        # Capture a screenshot of the webpage
+        screenshot = capture_screenshot(url)
+
+        # Load the screenshot image
+        image = Image.open(BytesIO(screenshot))
+
+        # Download and load the OmniParser model and processor
+        model_repo = "microsoft/OmniParser"
+        processor = BlipProcessor.from_pretrained(model_repo)
+        model = BlipForConditionalGeneration.from_pretrained(model_repo)
+
+        # Preprocess the image
+        inputs = processor(images=image, return_tensors="pt")
+
+        # Generate structured data
+        outputs = model.generate(**inputs)
+        structured_data = processor.decode(outputs[0], skip_special_tokens=True)
+
+        return {'structured_data': structured_data}
     except requests.RequestException as e:
         return {'error': str(e)}
 TASK_FUNCTIONS["extract_content"] = extract_content
+
+def capture_screenshot(url):
+    # Set up Chrome options for headless browsing
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--window-size=1920,1080")  # Set initial window size
+
+    # Initialize the Chrome WebDriver
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+
+    try:
+        # Navigate to the specified URL
+        driver.get(url)
+
+        # Allow time for the page to load completely
+        time.sleep(2)  # Adjust sleep time as necessary
+
+        # Calculate the total height of the page
+        total_height = driver.execute_script("return document.body.scrollHeight")
+
+        # Set the window size to the total height of the page
+        driver.set_window_size(1920, total_height)
+
+        # Allow time for the window size adjustment
+        time.sleep(5)  # Adjust sleep time as necessary
+
+        # Capture the screenshot
+        screenshot = driver.get_screenshot_as_png()
+
+        return screenshot
+    finally:
+        # Close the WebDriver
+        driver.quit()
 
 def validate_fact(task_params, cache=None):
     statement = task_params.get('statement')

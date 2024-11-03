@@ -20,8 +20,12 @@ def send_llm_request(prompt, cache, model_name, api_url, expect_json=True):
     payload = {"model": model_name, "prompt": prompt}
     headers = {"Content-Type": "application/json"}
 
+    logger.debug(f"Sending LLM request with payload: {payload}")
+
     try:
         response = requests.post(api_url, json=payload, headers=headers, stream=True)
+
+        logger.debug(f"LLM response status code: {response.status_code}")
 
         # Collect streaming response
         response_text = ""
@@ -30,6 +34,7 @@ def send_llm_request(prompt, cache, model_name, api_url, expect_json=True):
                 try:
                     # Parse each line as JSON to check done status
                     line_json = json.loads(line.decode('utf-8'))
+                    logger.debug(f"Received line: {line_json}")
                     if "response" in line_json:
                         response_text += line_json["response"]
                     if line_json.get("done", False):
@@ -59,6 +64,6 @@ def send_llm_request(prompt, cache, model_name, api_url, expect_json=True):
     except requests.exceptions.RequestException as e:
         logger.error(f"LLM request failed: {e}")
         return "" if not expect_json else {}  # Return empty response on error
-    except json.JSONDecodeError:
-        logger.error("Failed to parse JSON response from accumulated response.")
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON response from accumulated response: {e}")
         return ""

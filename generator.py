@@ -22,9 +22,24 @@ CACHE_FILE = os.path.join(OUTPUT_DIR, 'cache.db')
 LOG_FILE = os.path.join(OUTPUT_DIR, 'generator.log')
 
 # Configure logging
-logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG,
-                    format='%(asctime)s %(levelname)s:%(message)s')
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Create handlers
+file_handler = logging.FileHandler(LOG_FILE)
+file_handler.setLevel(logging.DEBUG)
+
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.DEBUG)
+
+# Create formatters and add to handlers
+formatter = logging.Formatter('%(asctime)s %(levelname)s:%(message)s')
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# Add handlers to logger
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
 # Database functions
 def init_db():
@@ -142,7 +157,7 @@ def execute_task(task_name, parameters, cache=None):
     task_function = tasks.TASK_FUNCTIONS.get(task_name)
 
     # Log task_name and parameters to debug
-    print(f"Executing task: {task_name}, with parameters: {parameters}")
+    logger.debug(f"Executing task: {task_name}, with parameters: {parameters}")
     if not isinstance(parameters, dict):
         raise TypeError(f"Expected parameters to be a dictionary, got {type(parameters)}")
 
@@ -154,6 +169,8 @@ def execute_task(task_name, parameters, cache=None):
 def process_task(task, question_id, conn, cache):
     task_name = task.get("name")
     parameters = task.get("parameters", {})
+
+    logger.debug(f"Processing task '{task_name}' with parameters {parameters}")
 
     # Check if the task has already been performed with the same parameters
     existing_outcome = get_existing_task_outcome(conn, task_name, parameters)
@@ -227,12 +244,19 @@ def process_question(question_id, conn, cache):
         return None
     question_text, status, existing_answer = question_row
 
+    logger.debug(f"Processing question ID {question_id}, status: {status}")
+
     # If the question is already answered, return the answer
     if status == 'answered' and existing_answer:
+        logger.info(f"Question ID {question_id} is already answered.")
         return existing_answer
 
     # Generate tasks, subquestions, and attempt to answer
     answer, tasks_to_perform, sub_questions = generate_tasks_and_subquestions(question_text, cache)
+
+    logger.debug(f"Generated answer: {answer}")
+    logger.debug(f"Generated tasks: {tasks_to_perform}")
+    logger.debug(f"Generated sub-questions: {sub_questions}")
 
     # If answer is provided, update question and return
     if answer:
@@ -244,8 +268,11 @@ def process_question(question_id, conn, cache):
 
     # Process tasks recursively
     for task in tasks_to_perform:
-        outcome = process_task(task, question_id, conn, cache)
-        task_outcomes.append(outcome)
+        try:
+            outcome = process_task(task, question_id, conn, cache)
+            task_outcomes.append(outcome)
+        except Exception as e:
+            logger.exception(f"Error processing task {task}: {e}")
 
     # Process sub-questions
     sub_answers = []
@@ -313,5 +340,8 @@ if __name__ == '__main__':
                 print(f"Answer to the main question: {main_answer}")
             else:
                 print("Could not find an answer to the main question.")
+        except Exception as e:
+            logger.exception("An error occurred during main execution.")
+            print(f"An error occurred: {e}")
         finally:
             conn.close()
