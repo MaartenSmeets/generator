@@ -38,8 +38,9 @@ file_handler.setFormatter(formatter)
 console_handler.setFormatter(formatter)
 
 # Add handlers to logger
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
+if not logger.handlers:
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
 
 # Database functions
 def init_db():
@@ -116,6 +117,7 @@ def get_existing_task_outcome(conn, task_type, parameters):
 # Define task and sub-question generation functions with structured output
 def generate_tasks_and_subquestions(question_text, cache):
     task_list = tasks.list_tasks()
+    logger.debug(f"Generating tasks and subquestions for question: {question_text}")
     prompt = {
         "task_generation": {
             "description": (
@@ -138,6 +140,7 @@ def generate_tasks_and_subquestions(question_text, cache):
     return answer, tasks_data, sub_questions
 
 def generate_answer_from_context(context, cache):
+    logger.debug("Generating answer from context.")
     prompt = {
         "answer_generation": {
             "description": (
@@ -159,11 +162,13 @@ def execute_task(task_name, parameters, cache=None):
     # Log task_name and parameters to debug
     logger.debug(f"Executing task: {task_name}, with parameters: {parameters}")
     if not isinstance(parameters, dict):
+        logger.error(f"Expected parameters to be a dictionary, got {type(parameters)}")
         raise TypeError(f"Expected parameters to be a dictionary, got {type(parameters)}")
 
     if task_function:
         return task_function(parameters, cache)
     else:
+        logger.error(f"No function found for task: {task_name}")
         raise ValueError(f"No function found for task: {task_name}")
 
 def process_task(task, question_id, conn, cache):
@@ -178,53 +183,92 @@ def process_task(task, question_id, conn, cache):
         logger.info(f"Using existing outcome for task '{task_name}' with parameters {parameters}")
         outcome = existing_outcome
     else:
-        outcome = execute_task(task_name, parameters, cache)
-        # Insert the task with the outcome
-        task_id = insert_task(conn, question_id, task_name, parameters, status='completed', outcome=outcome)
-        update_task_status(conn, task_id, 'completed', outcome)
+        try:
+            outcome = execute_task(task_name, parameters, cache)
+            # Insert the task with the outcome
+            task_id = insert_task(conn, question_id, task_name, parameters, status='completed', outcome=outcome)
+            update_task_status(conn, task_id, 'completed', outcome)
+        except Exception as e:
+            logger.exception(f"Error executing task '{task_name}' with parameters {parameters}: {e}")
+            outcome = {'error': str(e)}
 
     # Now, depending on the task and outcome, generate further tasks
     sub_task_outcomes = []
 
-    if task_name == 'search_query':
-        # For each search result, create 'extract_content' and 'summarize_text' tasks
-        search_results = outcome.get('search_results', [])
-        for result in search_results:
-            url = result.get('url')
-            sub_task = {
-                'name': 'extract_content',
-                'parameters': {'url': url}
-            }
-            sub_outcome = process_task(sub_task, question_id, conn, cache)
-            # Optionally, generate 'summarize_text' task for the content
-            page_content = sub_outcome.get('outcome', {}).get('page_content')
-            if page_content:
-                summarize_task = {
-                    'name': 'summarize_text',
-                    'parameters': {'text': page_content}
-                }
-                summary_outcome = process_task(summarize_task, question_id, conn, cache)
-                # Collect summaries
-                sub_task_outcomes.append({
-                    'url': url,
-                    'summary': summary_outcome.get('outcome', {}).get('summary')
-                })
-    elif task_name == 'validate_fact':
-        # Perform fact validation task
-        outcome = execute_task(task_name, parameters, cache)
-
-        # If outcome contains validation result, add it to sub_task_outcomes
-        is_true = outcome.get("is_true", False)
-        confidence = outcome.get("confidence", 0.0)
-        sources = outcome.get("sources", [])
-        
+    if 'error' in outcome:
+        logger.error(f"Error in task '{task_name}': {outcome['error']}")
+        # Decide how to handle the error
+        # For now, include the error in the sub_task_outcomes
         sub_task_outcomes.append({
-            "task_name": task_name,
-            "statement": parameters.get("statement"),
-            "is_true": is_true,
-            "confidence": confidence,
-            "sources": sources
+            'task_name': task_name,
+            'parameters': parameters,
+            'error': outcome['error']
         })
+    else:
+        if task_name == 'search_query':
+            # For each search result, create 'extract_content' and 'summarize_text' tasks
+            search_results = outcome.get('search_results', [])
+            for result in search_results:
+                url = result.get('url')
+                sub_task = {
+                    'name': 'extract_content',
+                    'parameters': {'url': url}
+                }
+                sub_outcome = process_task(sub_task, question_id, conn, cache)
+                if 'error' in sub_outcome.get('outcome', {}):
+                    logger.error(f"Error in sub-task 'extract_content': {sub_outcome['outcome']['error']}")
+                    sub_task_outcomes.append({
+                        'url': url,
+                        'error': sub_outcome['outcome']['error']
+                    })
+                    continue
+                structured_data = sub_outcome.get('outcome', {}).get('structured_data')
+                if structured_data:
+                    summarize_task = {
+                        'name': 'summarize_text',
+                        'parameters': {'text': json.dumps(structured_data)}
+                    }
+                    summary_outcome = process_task(summarize_task, question_id, conn, cache)
+                    if 'error' in summary_outcome.get('outcome', {}):
+                        logger.error(f"Error in sub-task 'summarize_text': {summary_outcome['outcome']['error']}")
+                        sub_task_outcomes.append({
+                            'url': url,
+                            'error': summary_outcome['outcome']['error']
+                        })
+                        continue
+                    # Collect summaries
+                    sub_task_outcomes.append({
+                        'url': url,
+                        'summary': summary_outcome.get('outcome', {}).get('summary')
+                    })
+                else:
+                    logger.warning(f"No structured data extracted from URL: {url}")
+                    sub_task_outcomes.append({
+                        'url': url,
+                        'error': 'No structured data extracted'
+                    })
+        elif task_name == 'validate_fact':
+             # Check for errors in outcome
+            if 'error' in outcome:
+                logger.error(f"Error in task '{task_name}': {outcome['error']}")
+                sub_task_outcomes.append({
+                    "task_name": task_name,
+                    "statement": parameters.get("statement"),
+                    "error": outcome['error']
+                })
+            else:
+                # If outcome contains validation result, add it to sub_task_outcomes
+                is_true = outcome.get("is_true", False)
+                confidence = outcome.get("confidence", 0.0)
+                sources = outcome.get("sources", [])
+                
+                sub_task_outcomes.append({
+                    "task_name": task_name,
+                    "statement": parameters.get("statement"),
+                    "is_true": is_true,
+                    "confidence": confidence,
+                    "sources": sources
+                })
 
     # Return the final outcome, possibly including sub_task_outcomes
     return {
@@ -273,6 +317,11 @@ def process_question(question_id, conn, cache):
             task_outcomes.append(outcome)
         except Exception as e:
             logger.exception(f"Error processing task {task}: {e}")
+            task_outcomes.append({
+                'task_name': task.get('name'),
+                'parameters': task.get('parameters'),
+                'error': str(e)
+            })
 
     # Process sub-questions
     sub_answers = []
@@ -290,6 +339,8 @@ def process_question(question_id, conn, cache):
         sub_answer = process_question(sub_question_id, conn, cache)
         if sub_answer:
             sub_answers.append(sub_answer)
+        else:
+            sub_answers.append(f"Could not find an answer to sub-question: {sub_question_text}")
 
     # After processing tasks and subquestions, attempt to answer the question using the collected information
     combined_context = {
