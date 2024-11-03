@@ -1,3 +1,4 @@
+# tasks.py
 from typing import List, Dict, Any, Union, Callable
 import requests
 import os
@@ -6,13 +7,15 @@ from bs4 import BeautifulSoup
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
 import spacy
-from transformers import pipeline, AutoTokenizer
 import pytesseract
 from PIL import Image
 from googletrans import Translator
 from rake_nltk import Rake
 import subprocess
-import torch
+from llm_utils import send_llm_request
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Download NLTK resources automatically if they are missing
 try:
@@ -35,14 +38,11 @@ except OSError:
     subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"])
     nlp = spacy.load("en_core_web_sm")
 
-# Initialize the summarizer and tokenizer once
-device = 0 if torch.cuda.is_available() else -1
-summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=device)
-tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large-cnn")
-
+OLLAMA_URL = "http://localhost:11434/api/generate"  # Replace with your actual endpoint
+SUMMARIZER_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Configurable summarizer model name
 
 # Define a dictionary to map task names to functions
-TASK_FUNCTIONS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {}
+TASK_FUNCTIONS: Dict[str, Callable[[Dict[str, Any], Any], Dict[str, Any]]] = {}
 
 def list_tasks() -> List[Dict[str, Any]]:
     """Return a list of available tasks with descriptions, parameters, and outcomes."""
@@ -116,7 +116,7 @@ def list_tasks() -> List[Dict[str, Any]]:
     ]
 
 # Task function implementations
-def search_query(task_params):
+def search_query(task_params, cache=None):
     query = task_params.get('query')
     # Read API key from local file
     try:
@@ -149,7 +149,7 @@ def search_query(task_params):
         return {"error": "Failed to retrieve search results"}
 TASK_FUNCTIONS["search_query"] = search_query
 
-def extract_content(task_params):
+def extract_content(task_params, cache=None):
     url = task_params.get('url')
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
@@ -165,57 +165,56 @@ def extract_content(task_params):
         return {'error': str(e)}
 TASK_FUNCTIONS["extract_content"] = extract_content
 
-def validate_fact(task_params):
+def validate_fact(task_params, cache=None):
     statement = task_params.get('statement')
-    # Use search_query function to get search results for the statement
+    if not statement:
+        return {"error": "No statement provided for validation."}
+
+    # Step 1: Perform a search query to find relevant pages
     search_results = search_query({'query': statement})
     if 'error' in search_results:
-        return {"error": "Failed to validate fact"}
-    # Fetch and parse the pages using the updated extract_content function
+        return {"error": "Failed to retrieve search results for fact validation"}
+
+    # Step 2: Extract content from each search result
     verified_sources = []
     for result in search_results.get('search_results', []):
-        content_result = extract_content({'url': result['url']})
-        if 'page_content' in content_result and 'error' not in content_result:
-            if statement.lower() in content_result['page_content'].lower():
-                verified_sources.append(result['url'])
+        url = result.get('url')
+        content_result = extract_content({'url': url})
+
+        if 'page_content' in content_result:
+            page_content = content_result['page_content'].lower()
+            if statement.lower() in page_content:
+                verified_sources.append(url)
+
+    # Step 3: Calculate confidence based on verified sources
     is_true = bool(verified_sources)
-    confidence = 0.9 if is_true else 0.1
-    sources = verified_sources
-    return {"is_true": is_true, "confidence": confidence, "sources": sources}
+    confidence = min(1.0, 0.2 + len(verified_sources) * 0.2)  # Confidence increases with more sources
+
+    return {
+        "is_true": is_true,
+        "confidence": confidence,
+        "sources": verified_sources
+    }
+
 TASK_FUNCTIONS["validate_fact"] = validate_fact
 
-def summarize_text(task_params):
+def summarize_text(task_params, cache=None):
     text = task_params.get('text', '')
     if not text:
         return {"error": "No text provided for summarization."}
 
-    max_input_length = tokenizer.model_max_length  # 1024 tokens for BART
-    inputs = tokenizer.encode(text, return_tensors='pt')
-    input_length = inputs.shape[1]
+    prompt = (
+        "Please provide a concise and comprehensive summary of the following text. "
+        "Ensure that the summary captures the key points and main ideas in a clear and coherent manner.\n\n"
+        f"Text:\n{text}\n\nSummary:"
+    )
 
-    if input_length > max_input_length:
-        # Split the text into chunks
-        chunks = []
-        stride = max_input_length - 200  # Overlap for better context
-        for i in range(0, input_length, stride):
-            end = i + max_input_length
-            chunk_input_ids = inputs[:, i:end]
-            chunk_text = tokenizer.decode(chunk_input_ids[0], skip_special_tokens=True)
-            chunks.append(chunk_text)
-    else:
-        chunks = [text]
-
-    summaries = []
-    for chunk in chunks:
-        summary = summarizer(chunk, max_length=130, min_length=30, do_sample=False)
-        summaries.append(summary[0]['summary_text'])
-
-    final_summary = ' '.join(summaries)
-    return {"summary": final_summary}
+    summary = send_llm_request(prompt, cache, SUMMARIZER_MODEL_NAME, OLLAMA_URL, expect_json=False)
+    return {"summary": summary}
 
 TASK_FUNCTIONS["summarize_text"] = summarize_text
 
-def analyze_sentiment(task_params):
+def analyze_sentiment(task_params, cache=None):
     text = task_params.get('text')
     sia = SentimentIntensityAnalyzer()
     sentiment_scores = sia.polarity_scores(text)
@@ -231,7 +230,7 @@ def analyze_sentiment(task_params):
     return {"sentiment": sentiment, "confidence": confidence}
 TASK_FUNCTIONS["analyze_sentiment"] = analyze_sentiment
 
-def extract_entities(task_params):
+def extract_entities(task_params, cache=None):
     text = task_params.get('text')
     doc = nlp(text)
     entities = []
@@ -240,15 +239,25 @@ def extract_entities(task_params):
     return {"entities": entities}
 TASK_FUNCTIONS["extract_entities"] = extract_entities
 
-def answer_question(task_params):
+def answer_question(task_params, cache=None):
     question = task_params.get('question')
     context = task_params.get('context')
-    qa_pipeline = pipeline("question-answering", model="distilbert-base-cased-distilled-squad")
-    answer = qa_pipeline(question=question, context=context)
-    return {"answer": answer['answer']}
+    if not question or not context:
+        return {"error": "Both 'question' and 'context' must be provided."}
+
+    prompt = (
+        "Based on the following context, please provide a detailed and accurate answer to the question.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question:\n{question}\n\n"
+        "Answer:"
+    )
+
+    answer = send_llm_request(prompt, cache, SUMMARIZER_MODEL_NAME, OLLAMA_URL, expect_json=False)
+    return {"answer": answer}
+
 TASK_FUNCTIONS["answer_question"] = answer_question
 
-def extract_text_from_image(task_params):
+def extract_text_from_image(task_params, cache=None):
     image_path = task_params.get('image_path')
     # Ensure that tesseract is installed and configured properly
     try:
@@ -259,7 +268,7 @@ def extract_text_from_image(task_params):
         return {"error": str(e)}
 TASK_FUNCTIONS["extract_text_from_image"] = extract_text_from_image
 
-def translate_text(task_params):
+def translate_text(task_params, cache=None):
     text = task_params.get('text')
     language = task_params.get('language')
     translator = Translator()
@@ -267,7 +276,7 @@ def translate_text(task_params):
     return {"translated_text": translation.text}
 TASK_FUNCTIONS["translate_text"] = translate_text
 
-def parse_json(task_params):
+def parse_json(task_params, cache=None):
     file_path = task_params.get('file_path')
     try:
         with open(file_path, 'r') as f:
@@ -277,7 +286,7 @@ def parse_json(task_params):
         return {"error": str(e)}
 TASK_FUNCTIONS["parse_json"] = parse_json
 
-def extract_keywords(task_params):
+def extract_keywords(task_params, cache=None):
     text = task_params.get('text')
     rake_nltk_var = Rake()
     rake_nltk_var.extract_keywords_from_text(text)

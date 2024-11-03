@@ -1,3 +1,4 @@
+# generator.py
 import sqlite3
 import json
 import os
@@ -8,6 +9,7 @@ import re
 import shelve
 import tasks
 from typing import List, Dict, Any, Union, Callable
+from llm_utils import send_llm_request
 
 # Define constants and output directory
 OUTPUT_DIR = "output"
@@ -96,58 +98,6 @@ def get_existing_task_outcome(conn, task_type, parameters):
         return json.loads(row[0]) if row[0] else None
     return None
 
-# LLM Integration
-def generate_cache_key(prompt):
-    return hashlib.sha256(prompt.encode()).hexdigest()
-
-def send_llm_request(prompt, cache):
-    cache_key = generate_cache_key(prompt)
-    if cache_key in cache:
-        logger.info("Cache hit for LLM prompt.")
-        return cache[cache_key]
-
-    payload = {"model": MODEL_NAME, "prompt": prompt}
-    headers = {"Content-Type": "application/json"}
-
-    try:
-        response = requests.post(OLLAMA_URL, json=payload, headers=headers, stream=True)
-
-        # Collect streaming response
-        response_text = ""
-        for line in response.iter_lines():
-            if line:
-                try:
-                    # Parse each line as JSON to check `done` status
-                    line_json = json.loads(line.decode('utf-8'))
-                    if "response" in line_json:
-                        response_text += line_json["response"]
-                    if line_json.get("done", False):
-                        break
-                except json.JSONDecodeError:
-                    logger.warning("Skipping non-JSON line in response stream.")
-                    continue
-
-        # Once complete, attempt to parse accumulated response
-        logger.debug(f"Complete LLM response: {response_text}")
-
-        # Use regex to isolate JSON content in case there is surrounding text
-        json_match = re.search(r'(\{.*\})', response_text, re.DOTALL)
-        if json_match:
-            json_content = json_match.group(1)
-            llm_response = json.loads(json_content)  # Parse JSON content
-            cache[cache_key] = llm_response  # Save to persistent cache
-            return llm_response
-        else:
-            logger.error("Failed to extract JSON from accumulated response.")
-            return {}  # Default to empty dict if JSON not found
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"LLM request failed: {e}")
-        return {}  # Return empty dict on error
-    except json.JSONDecodeError:
-        logger.error("Failed to parse JSON response from accumulated response.")
-        return {}
-
 # Define task and sub-question generation functions with structured output
 def generate_tasks_and_subquestions(question_text, cache):
     task_list = tasks.list_tasks()
@@ -165,8 +115,7 @@ def generate_tasks_and_subquestions(question_text, cache):
         }
     }
     prompt_str = json.dumps(prompt)
-    response = send_llm_request(prompt_str, cache)
-
+    response = send_llm_request(prompt_str, cache, MODEL_NAME, OLLAMA_URL)
     # Extract answer, tasks, and subquestions
     answer = response.get("answer", "")
     tasks_data = response.get("tasks", [])
@@ -184,12 +133,12 @@ def generate_answer_from_context(context, cache):
         }
     }
     prompt_str = json.dumps(prompt)
-    response = send_llm_request(prompt_str, cache)
+    response = send_llm_request(prompt_str, cache, MODEL_NAME, OLLAMA_URL)
     answer = response.get('answer', "")
     return answer
 
 # Task Execution
-def execute_task(task_name, parameters):
+def execute_task(task_name, parameters, cache=None):
     task_function = tasks.TASK_FUNCTIONS.get(task_name)
 
     # Log task_name and parameters to debug
@@ -198,7 +147,7 @@ def execute_task(task_name, parameters):
         raise TypeError(f"Expected parameters to be a dictionary, got {type(parameters)}")
 
     if task_function:
-        return task_function(parameters)
+        return task_function(parameters, cache)
     else:
         raise ValueError(f"No function found for task: {task_name}")
 
@@ -212,7 +161,7 @@ def process_task(task, question_id, conn, cache):
         logger.info(f"Using existing outcome for task '{task_name}' with parameters {parameters}")
         outcome = existing_outcome
     else:
-        outcome = execute_task(task_name, parameters)
+        outcome = execute_task(task_name, parameters, cache)
         # Insert the task with the outcome
         task_id = insert_task(conn, question_id, task_name, parameters, status='completed', outcome=outcome)
         update_task_status(conn, task_id, 'completed', outcome)
@@ -244,9 +193,21 @@ def process_task(task, question_id, conn, cache):
                     'summary': summary_outcome.get('outcome', {}).get('summary')
                 })
     elif task_name == 'validate_fact':
-        # Handle validation tasks if needed
-        pass
-    # Handle other task types as needed
+        # Perform fact validation task
+        outcome = execute_task(task_name, parameters, cache)
+
+        # If outcome contains validation result, add it to sub_task_outcomes
+        is_true = outcome.get("is_true", False)
+        confidence = outcome.get("confidence", 0.0)
+        sources = outcome.get("sources", [])
+        
+        sub_task_outcomes.append({
+            "task_name": task_name,
+            "statement": parameters.get("statement"),
+            "is_true": is_true,
+            "confidence": confidence,
+            "sources": sources
+        })
 
     # Return the final outcome, possibly including sub_task_outcomes
     return {
