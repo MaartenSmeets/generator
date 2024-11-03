@@ -1,95 +1,356 @@
-import os
-import requests
-import shelve
-import hashlib
-import logging
+import sqlite3
 import json
+import os
+import logging
+import requests
+import hashlib
+import re
+import shelve
+import tasks
+from typing import List, Dict, Any, Union, Callable
 
-# Define constants
-OLLAMA_URL = "http://localhost:11434/api/generate"  # Updated to use generate endpoint
-MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Replace with your actual model name
-OUTPUT_DIR = 'output'  # Output directory for logs and database files
-CACHE_FILE = os.path.join(OUTPUT_DIR, 'llm_cache')
-LOG_FILE = os.path.join(OUTPUT_DIR, 'app.log')
-
-# Ensure output directory exists
+# Define constants and output directory
+OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Configure logging to file and console
-logging.basicConfig(level=logging.DEBUG, handlers=[
-    logging.FileHandler(LOG_FILE),
-    logging.StreamHandler()
-])
+OLLAMA_URL = "http://localhost:11434/api/generate"  # Replace with your actual endpoint
+MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Replace with your actual model name
+DATABASE_FILE = os.path.join(OUTPUT_DIR, 'tasks.db')
+CACHE_FILE = os.path.join(OUTPUT_DIR, 'cache.db')
+LOG_FILE = os.path.join(OUTPUT_DIR, 'generator.log')
+
+# Configure logging
+logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG,
+                    format='%(asctime)s %(levelname)s:%(message)s')
 logger = logging.getLogger(__name__)
 
-# Initialize cache
-def init_cache():
-    return shelve.open(CACHE_FILE, writeback=False)
+# Database functions
+def init_db():
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS Questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            parent_id INTEGER,
+            text TEXT NOT NULL,
+            status TEXT NOT NULL,
+            answer TEXT,
+            FOREIGN KEY(parent_id) REFERENCES Questions(id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS Tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            question_id INTEGER NOT NULL,
+            task_type TEXT NOT NULL,
+            parameters TEXT,
+            status TEXT NOT NULL,
+            outcome TEXT,
+            FOREIGN KEY(question_id) REFERENCES Questions(id)
+        )
+    ''')
+    conn.commit()
+    return conn
 
-# Close cache on exit
-cache = init_cache()
-def close_cache():
-    cache.close()
-import atexit
-atexit.register(close_cache)
+def insert_question(conn, text, parent_id=None, status='pending', answer=None):
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO Questions (text, parent_id, status, answer)
+        VALUES (?, ?, ?, ?)
+    ''', (text, parent_id, status, answer))
+    conn.commit()
+    return cursor.lastrowid
 
-# Generate a unique cache key
+def update_question_status(conn, question_id, status, answer=None):
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE Questions SET status = ?, answer = ? WHERE id = ?
+    ''', (status, answer, question_id))
+    conn.commit()
+
+def insert_task(conn, question_id, task_type, parameters, status='pending', outcome=None):
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO Tasks (question_id, task_type, parameters, status, outcome)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (question_id, task_type, json.dumps(parameters), status, json.dumps(outcome)))
+    conn.commit()
+    return cursor.lastrowid
+
+def update_task_status(conn, task_id, status, outcome=None):
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE Tasks SET status = ?, outcome = ? WHERE id = ?
+    ''', (status, json.dumps(outcome), task_id))
+    conn.commit()
+
+def get_existing_task_outcome(conn, task_type, parameters):
+    cursor = conn.cursor()
+    parameters_json = json.dumps(parameters, sort_keys=True)
+    cursor.execute('''
+        SELECT outcome FROM Tasks
+        WHERE task_type = ? AND parameters = ? AND status = 'completed'
+    ''', (task_type, parameters_json))
+    row = cursor.fetchone()
+    if row:
+        return json.loads(row[0]) if row[0] else None
+    return None
+
+# LLM Integration
 def generate_cache_key(prompt):
-    key = f"{prompt}"
-    return hashlib.sha256(key.encode()).hexdigest()
+    return hashlib.sha256(prompt.encode()).hexdigest()
 
-# Send a request to the LLM using the generate endpoint and yield the response progressively
-def send_llm_request(prompt):
+def send_llm_request(prompt, cache):
     cache_key = generate_cache_key(prompt)
     if cache_key in cache:
-        logger.info("Cache hit for prompt.")
-        yield cache[cache_key]
-        return
-    
-    # Payload for Ollama's generate API endpoint
-    payload = {"model": MODEL_NAME, "prompt": prompt, "stream": True}  # Enable streaming
+        logger.info("Cache hit for LLM prompt.")
+        return cache[cache_key]
+
+    payload = {"model": MODEL_NAME, "prompt": prompt}
     headers = {"Content-Type": "application/json"}
 
-    full_response = ""
-
     try:
-        # Use streaming to handle the response line by line
-        with requests.post(OLLAMA_URL, json=payload, headers=headers, stream=True) as response:
-            response.raise_for_status()  # Raise an exception for HTTP errors
+        response = requests.post(OLLAMA_URL, json=payload, headers=headers, stream=True)
 
-            # Process each line as it's received
-            for line in response.iter_lines():
-                if line:
-                    try:
-                        # Parse each JSON line
-                        json_data = json.loads(line.decode('utf-8'))
-                        if 'response' in json_data:
-                            # Append to the full response
-                            chunk = json_data['response']
-                            full_response += chunk
-                            yield chunk  # Yield each chunk as it is received
-                    except json.JSONDecodeError as e:
-                        logger.error(f"JSON decode error: {e}")
+        # Collect streaming response
+        response_text = ""
+        for line in response.iter_lines():
+            if line:
+                try:
+                    # Parse each line as JSON to check `done` status
+                    line_json = json.loads(line.decode('utf-8'))
+                    if "response" in line_json:
+                        response_text += line_json["response"]
+                    if line_json.get("done", False):
+                        break
+                except json.JSONDecodeError:
+                    logger.warning("Skipping non-JSON line in response stream.")
+                    continue
 
-            # Cache the full response after streaming completes
-            cache[cache_key] = full_response
-            logger.info("Successfully received full response from LLM and cached it.")
+        # Once complete, attempt to parse accumulated response
+        logger.debug(f"Complete LLM response: {response_text}")
+
+        # Use regex to isolate JSON content in case there is surrounding text
+        json_match = re.search(r'(\{.*\})', response_text, re.DOTALL)
+        if json_match:
+            json_content = json_match.group(1)
+            llm_response = json.loads(json_content)  # Parse JSON content
+            cache[cache_key] = llm_response  # Save to persistent cache
+            return llm_response
+        else:
+            logger.error("Failed to extract JSON from accumulated response.")
+            return {}  # Default to empty dict if JSON not found
 
     except requests.exceptions.RequestException as e:
         logger.error(f"LLM request failed: {e}")
-        yield "Error: Unable to process request."
+        return {}  # Return empty dict on error
+    except json.JSONDecodeError:
+        logger.error("Failed to parse JSON response from accumulated response.")
+        return {}
 
-# Wrapper function to collect the entire response as a single string
-def get_llm_response(prompt):
-    response_generator = send_llm_request(prompt)
-    response = "".join(response_generator)  # Collect all chunks into a single string
-    return response
+# Define task and sub-question generation functions with structured output
+def generate_tasks_and_subquestions(question_text, cache):
+    task_list = tasks.list_tasks()
+    prompt = {
+        "task_generation": {
+            "description": (
+                "Please analyze the question below and decompose it into smaller, more specific sub-questions that can help in answering the main question comprehensively. "
+                "For each sub-question, consider what tasks might be necessary to answer it, such as performing search queries, extracting content, summarizing information, etc. "
+                "Generate a list of tasks with appropriate parameters needed to answer the sub-questions and the main question. "
+                "Return ONLY valid JSON with three keys: 'answer' (a string, can be empty), 'tasks' (a list of dictionaries with 'name' and 'parameters'), 'subquestions' (a list of strings). "
+                "Ensure that tasks are practical and can be executed by the system. No additional text or explanations."
+            ),
+            "parameters": {"question": question_text},
+            "task_list": task_list,
+        }
+    }
+    prompt_str = json.dumps(prompt)
+    response = send_llm_request(prompt_str, cache)
 
-# Example usage
-if __name__ == "__main__":
-    prompt = "Hello, how can I help you today?"
+    # Extract answer, tasks, and subquestions
+    answer = response.get("answer", "")
+    tasks_data = response.get("tasks", [])
+    sub_questions = response.get("subquestions", [])
+    return answer, tasks_data, sub_questions
 
-    logger.info("Starting the LLM request example.")
-    response = get_llm_response(prompt)
-    logger.info(f"LLM Response: {response}")
-    print("LLM Response:", response)
+def generate_answer_from_context(context, cache):
+    prompt = {
+        "answer_generation": {
+            "description": (
+                "Based on the provided context, which includes the question, tasks with their parameters and outcomes, and sub-answers, generate an answer to the question. "
+                "Ensure all sources are verified and include concrete URL references. Return ONLY valid JSON with one key: 'answer' (a string). No additional text or explanations."
+            ),
+            "parameters": context
+        }
+    }
+    prompt_str = json.dumps(prompt)
+    response = send_llm_request(prompt_str, cache)
+    answer = response.get('answer', "")
+    return answer
+
+# Task Execution
+def execute_task(task_name, parameters):
+    task_function = tasks.TASK_FUNCTIONS.get(task_name)
+
+    # Log task_name and parameters to debug
+    print(f"Executing task: {task_name}, with parameters: {parameters}")
+    if not isinstance(parameters, dict):
+        raise TypeError(f"Expected parameters to be a dictionary, got {type(parameters)}")
+
+    if task_function:
+        return task_function(parameters)
+    else:
+        raise ValueError(f"No function found for task: {task_name}")
+
+def process_task(task, question_id, conn, cache):
+    task_name = task.get("name")
+    parameters = task.get("parameters", {})
+
+    # Check if the task has already been performed with the same parameters
+    existing_outcome = get_existing_task_outcome(conn, task_name, parameters)
+    if existing_outcome is not None:
+        logger.info(f"Using existing outcome for task '{task_name}' with parameters {parameters}")
+        outcome = existing_outcome
+    else:
+        outcome = execute_task(task_name, parameters)
+        # Insert the task with the outcome
+        task_id = insert_task(conn, question_id, task_name, parameters, status='completed', outcome=outcome)
+        update_task_status(conn, task_id, 'completed', outcome)
+
+    # Now, depending on the task and outcome, generate further tasks
+    sub_task_outcomes = []
+
+    if task_name == 'search_query':
+        # For each search result, create 'extract_content' and 'summarize_text' tasks
+        search_results = outcome.get('search_results', [])
+        for result in search_results:
+            url = result.get('url')
+            sub_task = {
+                'name': 'extract_content',
+                'parameters': {'url': url}
+            }
+            sub_outcome = process_task(sub_task, question_id, conn, cache)
+            # Optionally, generate 'summarize_text' task for the content
+            page_content = sub_outcome.get('outcome', {}).get('page_content')
+            if page_content:
+                summarize_task = {
+                    'name': 'summarize_text',
+                    'parameters': {'text': page_content}
+                }
+                summary_outcome = process_task(summarize_task, question_id, conn, cache)
+                # Collect summaries
+                sub_task_outcomes.append({
+                    'url': url,
+                    'summary': summary_outcome.get('outcome', {}).get('summary')
+                })
+    elif task_name == 'validate_fact':
+        # Handle validation tasks if needed
+        pass
+    # Handle other task types as needed
+
+    # Return the final outcome, possibly including sub_task_outcomes
+    return {
+        'task_name': task_name,
+        'parameters': parameters,
+        'outcome': outcome,
+        'sub_tasks': sub_task_outcomes
+    }
+
+# Recursive question processing
+def process_question(question_id, conn, cache):
+    cursor = conn.cursor()
+    cursor.execute('SELECT text, status, answer FROM Questions WHERE id = ?', (question_id,))
+    question_row = cursor.fetchone()
+    if not question_row:
+        logger.error(f"Question ID {question_id} not found.")
+        return None
+    question_text, status, existing_answer = question_row
+
+    # If the question is already answered, return the answer
+    if status == 'answered' and existing_answer:
+        return existing_answer
+
+    # Generate tasks, subquestions, and attempt to answer
+    answer, tasks_to_perform, sub_questions = generate_tasks_and_subquestions(question_text, cache)
+
+    # If answer is provided, update question and return
+    if answer:
+        update_question_status(conn, question_id, 'answered', answer)
+        return answer
+
+    # Initialize task outcomes
+    task_outcomes = []
+
+    # Process tasks recursively
+    for task in tasks_to_perform:
+        outcome = process_task(task, question_id, conn, cache)
+        task_outcomes.append(outcome)
+
+    # Process sub-questions
+    sub_answers = []
+    for sub_question_text in sub_questions:
+        # Check if sub-question already exists to avoid duplicates
+        cursor.execute('SELECT id, status, answer FROM Questions WHERE text = ? AND parent_id = ?', (sub_question_text, question_id))
+        result = cursor.fetchone()
+        if result:
+            sub_question_id, sub_status, sub_answer = result
+            if sub_status == 'answered' and sub_answer:
+                sub_answers.append(sub_answer)
+                continue
+        else:
+            sub_question_id = insert_question(conn, sub_question_text, parent_id=question_id)
+        sub_answer = process_question(sub_question_id, conn, cache)
+        if sub_answer:
+            sub_answers.append(sub_answer)
+
+    # After processing tasks and subquestions, attempt to answer the question using the collected information
+    combined_context = {
+        'question': question_text,
+        'tasks': task_outcomes,
+        'sub_answers': sub_answers
+    }
+    answer = generate_answer_from_context(combined_context, cache)
+    if answer:
+        update_question_status(conn, question_id, 'answered', answer)
+        return answer
+    else:
+        # If still cannot answer, mark as pending
+        update_question_status(conn, question_id, 'pending')
+        return None
+
+# Main execution flow
+if __name__ == '__main__':
+    conn = init_db()
+
+    # Open a persistent cache with shelve
+    with shelve.open(CACHE_FILE) as cache:
+        try:
+            question_text = """**Objective**: Create an elaborate complete markdown report detailing advancements in artificial intelligence only in October 2024, covering hardware, software, open-source developments and emerging trends (focus multiple large companies have shown recently) from reputable and credible sources. Ensure the report highlights recent trends and innovations that reflect the latest industry shifts and focus areas. Each statement should include online references to credible sources. Structure the report to appeal to a broad audience, including both technical and strategic stakeholders. Each section should be engaging, visual, and supported by concrete data from authoritative sources, preferably the official announcements, technical documentation, or product pages of the service providers or manufacturers.
+                **AI Hardware Advancements**: 
+                - Present major updates in AI-specific hardware, focusing on recent breakthroughs and trends:
+                    - Summarize upcoming releases or breakthroughs (e.g., new NVIDIA GPUs, Apple’s chips, advancements in edge AI hardware).
+                    - Provide performance comparisons to previous models to highlight improvements, efficiency gains, or scalability enhancements.
+                    - Include new use cases or efficiency gains expected from these advancements, and discuss how they reflect recent industry trends.
+
+                **Software Innovations**: 
+                - Outline cutting-edge software models and updates, including popular trends in AI applications:
+                    - Detail improvements in reasoning, multimodal capabilities, and efficiency with models like OpenAI’s GPT, Meta’s Llama, Google’s Gemini, and others that are driving new AI capabilities.
+                    - Emphasize recent developments in responsible AI, ethical AI practices, and any alignment improvements in popular models.
+                    - Include relevant benchmarks, unique features (such as increased context windows, enhanced image/video processing), and visual comparisons, highlighting recent improvements and trends.
+
+                **Open-Source Contributions**: 
+                - Showcase significant open-source AI releases, focusing on recent contributions and trends. Consider for example new open models and AI related frameworks. Consider LLMs and image generation models and other types when applicable.:
+                    - Highlight contributions from companies like Meta, Microsoft, Google, and others, explaining the anticipated impact and what is innovative about these tools.
+                    - Include real-world applications and potential impact, particularly in underrepresented regions or for solving specific societal challenges, showcasing the relevance to current global AI trends.
+
+                **Validation and Accuracy**: 
+                - Ensure all data points are accurate, verified, and from reputable sources. Avoid unverified claims by cross-referencing with multiple credible sources, primarily direct statements from the companies or technical documentation.
+            """
+            main_question_id = insert_question(conn, question_text)
+            main_answer = process_question(main_question_id, conn, cache)
+            if main_answer:
+                print(f"Answer to the main question: {main_answer}")
+            else:
+                print("Could not find an answer to the main question.")
+        finally:
+            conn.close()
