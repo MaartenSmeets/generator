@@ -23,7 +23,7 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 import time
-from omniparser.utils import (
+from utils import (
     get_som_labeled_img,
     check_ocr_box,
     get_caption_model_processor,
@@ -58,12 +58,12 @@ if not logger.handlers:
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
 
-device = 'cuda'
+device = 'cpu' #LLM claims GPU
 logger.debug("Loading SOM model.")
-som_model = get_yolo_model(model_path='omniparser/weights/icon_detect/best.pt')
+som_model = get_yolo_model(model_path='weights/icon_detect/best.pt')
 som_model.to(device)
 logger.debug("Loading caption model processor.")
-caption_model_processor = get_caption_model_processor(model_name="florence2", model_name_or_path="omniparser/weights/icon_caption_florence", device=device)
+caption_model_processor = get_caption_model_processor(model_name="florence2", model_name_or_path="weights/icon_caption_florence", device=device)
 
 # Download NLTK resources automatically if they are missing
 try:
@@ -209,6 +209,7 @@ def search_query(task_params, cache=None):
 TASK_FUNCTIONS["search_query"] = search_query
 
 def extract_content(task_params, cache=None):
+    import hashlib
     url = task_params.get('url')
     logger.debug(f"Starting extract_content with URL: {url}")
     if not url:
@@ -224,14 +225,14 @@ def extract_content(task_params, cache=None):
         screenshot = capture_screenshot(url)
         logger.debug("Captured screenshot of the webpage.")
 
-        # Generate a meaningful filename based on the URL
+        # Generate a unique filename using a hash of the URL
         parsed_url = urlparse(url)
         domain = parsed_url.netloc
-        path = parsed_url.path.strip('/').replace('/', '_')
-        filename = f"{domain}_{path}.png"
 
-        # Sanitize the filename to remove any invalid characters
-        filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        # Create a hash of the URL to use as filename
+        url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
+
+        filename = f"{domain}_{url_hash}.png"
         logger.debug(f"Generated filename for image: {filename}")
 
         # Define the output directory
@@ -241,7 +242,6 @@ def extract_content(task_params, cache=None):
 
         # Define the full path to save the image
         img_path = os.path.join(output_dir, filename)
-        
         logger.debug(f"Full image path: {img_path}")
 
         # Save the screenshot
@@ -258,46 +258,58 @@ def extract_content(task_params, cache=None):
         BOX_THRESHOLD = 0.03
 
         logger.debug("Starting OCR processing.")
-        ocr_bbox_rslt, is_goal_filtered = check_ocr_box(
-            image_path=img_path,
-            display_img=False,
-            output_bb_format='xyxy',
-            goal_filtering=None,
-            easyocr_args={'paragraph': False, 'text_threshold': 0.9},
-            use_paddleocr=True
-        )
-        if ocr_bbox_rslt is None:
-            logger.error("OCR bbox result is None.")
-            raise ValueError("OCR bbox result is None.")
-        text, ocr_bbox = ocr_bbox_rslt
-        logger.debug(f"OCR text length: {len(text)}, number of OCR boxes: {len(ocr_bbox)}")
+        try:
+            ocr_bbox_rslt, is_goal_filtered = check_ocr_box(
+                image_path=img_path,
+                display_img=False,
+                output_bb_format='xyxy',
+                goal_filtering=None,
+                easyocr_args={'paragraph': False, 'text_threshold': 0.9},
+                use_paddleocr=True
+            )
+            if ocr_bbox_rslt is None:
+                logger.error("OCR bbox result is None.")
+                raise ValueError("OCR bbox result is None.")
+            text, ocr_bbox = ocr_bbox_rslt
+            logger.debug(f"OCR text length: {len(text)}, number of OCR boxes: {len(ocr_bbox)}")
 
-        logger.debug("Starting SOM label extraction.")
-        som_result = get_som_labeled_img(
-            img_path=img_path,
-            model=som_model,
-            BOX_TRESHOLD=BOX_THRESHOLD,
-            output_coord_in_ratio=False,
-            ocr_bbox=ocr_bbox_rslt,  # Corrected variable name to match function output
-            draw_bbox_config=draw_bbox_config,
-            caption_model_processor=caption_model_processor,
-            ocr_text=[],  # Adjusted to match function default
-            use_local_semantics=True,
-            iou_threshold=0.1
-        )
-        if som_result is None:
-            logger.error("SOM labeled image result is None.")
-            raise ValueError("SOM labeled image result is None.")
-        dino_labeled_img, label_coordinates, parsed_content_list = som_result
-        logger.debug(f"Parsed content list length: {len(parsed_content_list)}")
+            logger.debug("Starting SOM label extraction.")
+            som_result = get_som_labeled_img(
+                img_path=img_path,
+                model=som_model,
+                BOX_TRESHOLD=BOX_THRESHOLD,
+                output_coord_in_ratio=False,
+                ocr_bbox=ocr_bbox,  # Pass the actual OCR bounding boxes
+                draw_bbox_config=draw_bbox_config,
+                caption_model_processor=caption_model_processor,
+                ocr_text=text,  # Pass the extracted text
+                use_local_semantics=True,
+                iou_threshold=0.1
+            )
+            if som_result is None:
+                logger.error("SOM labeled image result is None.")
+                raise ValueError("SOM labeled image result is None.")
+            dino_labeled_img, label_coordinates, parsed_content_list = som_result
+            logger.debug(f"Parsed content list length: {len(parsed_content_list)}")
 
-        return {'structured_data': parsed_content_list}
+            return {'structured_data': parsed_content_list}
+        except Exception as e:
+            logger.exception("An error occurred during OCR and SOM processing. Falling back to BeautifulSoup.")
+            # If OmniParser fails, use BeautifulSoup to extract content
+            logger.debug("Using BeautifulSoup to extract content.")
+            soup = BeautifulSoup(response.content, 'html.parser')
+            # Extract text content
+            texts = soup.stripped_strings
+            text_content = ' '.join(texts)
+            logger.debug(f"Extracted text content length: {len(text_content)}")
+            return {'structured_data': text_content}
+
     except requests.RequestException as e:
         logger.exception(f"RequestException occurred while fetching URL: {url}")
         return {'error': f"Failed to fetch URL: {str(e)}"}
     except Exception as e:
         logger.exception("An error occurred in extract_content.")
-        return {'error': f"Parsing failed with OmniParser: {str(e)}"}
+        return {'error': f"An unexpected error occurred: {str(e)}"}
 
 TASK_FUNCTIONS["extract_content"] = extract_content
 
@@ -326,7 +338,14 @@ def capture_screenshot(url):
         total_height = driver.execute_script("return document.body.scrollHeight")
         logger.debug(f"Total page height: {total_height}")
 
-        # Set the window size to the total height of the page
+        # Set a maximum height to avoid OpenCV errors
+        MAX_HEIGHT = 32766  # SHRT_MAX - 1
+
+        if total_height > MAX_HEIGHT:
+            logger.debug(f"Total height {total_height} exceeds maximum height {MAX_HEIGHT}. Limiting to {MAX_HEIGHT}.")
+            total_height = MAX_HEIGHT
+
+        # Set the window size to the total height of the page or the maximum height
         driver.set_window_size(1920, total_height)
         logger.debug("Window size set for full page height.")
 
@@ -393,14 +412,15 @@ def summarize_text(task_params, cache=None):
         return {"error": "No text provided for summarization."}
 
     prompt = (
-        "Please provide a concise and comprehensive summary of the following text. "
-        "Ensure that the summary captures the key points and main ideas in a clear and coherent manner.\n\n"
-        f"Text:\n{text}\n\nSummary:"
+        "Provide a summary of the following text, focusing only on the main points and key information. "
+        "Do not include any introductions, comments about the summarization process, or closing remarks. "
+        "If the content is messy, focus on the information you can obtain, considering the page is likely focused on a single topic.\n\n"
+        f"{text}\n\nSummary:"
     )
 
     try:
         summary = send_llm_request(prompt, cache, SUMMARIZER_MODEL_NAME, OLLAMA_URL, expect_json=False)
-        return {"summary": summary}
+        return {"summary": summary.strip()}
     except Exception as e:
         logger.exception("An error occurred while summarizing text.")
         return {"error": f"An error occurred while summarizing text: {str(e)}"}
@@ -540,3 +560,4 @@ def extract_keywords(task_params, cache=None):
         logger.exception("An error occurred while extracting keywords.")
         return {"error": f"An error occurred while extracting keywords: {str(e)}"}
 TASK_FUNCTIONS["extract_keywords"] = extract_keywords
+
