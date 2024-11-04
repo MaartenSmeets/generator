@@ -97,8 +97,11 @@ def list_tasks() -> List[Dict[str, Any]]:
     return [
         {
             "name": "search_query",
-            "description": "Perform a search query to gather relevant information.",
-            "parameters": ["query"],
+            "description": (
+                "Perform a search query to gather relevant information, with an optional 'from_date' parameter "
+                "to specify the time window for the search results (only options are 'past month' and 'past year')"
+            ),
+            "parameters": ["query", "from_date (optional)"],
             "outcomes": ["search_results"]
         },
         {
@@ -166,7 +169,8 @@ def list_tasks() -> List[Dict[str, Any]]:
 # Task function implementations
 def search_query(task_params, cache=None):
     query = task_params.get('query')
-    logger.debug(f"Performing search query: {query}")
+    from_date = task_params.get('from_date', 'past month')
+    logger.debug(f"Performing search query: {query}, from_date: {from_date}")
     if not query:
         logger.error("No query provided for search.")
         return {"error": "No query provided for search."}
@@ -185,6 +189,13 @@ def search_query(task_params, cache=None):
     data = {
         'q': query
     }
+    # Map 'from_date' to 'tbs' parameter
+    tbs_mapping = {
+        'past month': 'qdr:m',
+        'past year': 'qdr:y',
+    }
+    tbs_value = tbs_mapping.get(from_date.lower(), 'qdr:m')  # Default to 'past month'
+    data['tbs'] = tbs_value
     try:
         response = requests.post(url, headers=headers, json=data)
         response.raise_for_status()
@@ -206,6 +217,7 @@ def search_query(task_params, cache=None):
     except Exception as e:
         logger.exception("An unexpected error occurred during search query.")
         return {"error": f"An unexpected error occurred: {str(e)}"}
+        
 TASK_FUNCTIONS["search_query"] = search_query
 
 def extract_content(task_params, cache=None):

@@ -124,6 +124,7 @@ def generate_tasks_and_subquestions(question_text, cache):
                 "Please analyze the question below and decompose it into smaller, more specific sub-questions that can help in answering the main question comprehensively. "
                 "For each sub-question, consider what tasks might be necessary to answer it, such as performing search queries, extracting content, summarizing information, etc. "
                 "Generate a list of tasks with appropriate parameters needed to answer the sub-questions and the main question. "
+                "Note that the 'search_query' task can accept an optional 'from_date' parameter (can only be 'past month' or 'past year') to limit search results to recent information. Use this parameter when it is important to get the latest data. "
                 "Return ONLY valid JSON with three keys: 'answer' (a string, can be empty), 'tasks' (a list of dictionaries with 'name' and 'parameters'), 'subquestions' (a list of strings). "
                 "Ensure that tasks are practical and can be executed by the system. No additional text or explanations."
             ),
