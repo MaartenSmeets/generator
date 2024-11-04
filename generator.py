@@ -400,7 +400,24 @@ if __name__ == '__main__':
     # Open a persistent cache with shelve
     with shelve.open(CACHE_FILE) as cache:
         try:
-            question_text = """[Your question here]"""
+            question_text = question_text = """**Objective**: Create an elaborate complete markdown report detailing advancements in artificial intelligence only in October 2024, covering hardware, software, open-source developments and emerging trends (focus multiple large companies have shown recently) from reputable and credible sources. Ensure the report highlights recent trends and innovations that reflect the latest industry shifts and focus areas. Each statement should include online references to credible sources. Structure the report to appeal to a broad audience, including both technical and strategic stakeholders. Each section should be engaging, visual, and supported by concrete data from authoritative sources, preferably the official announcements, technical documentation, or product pages of the service providers or manufacturers.
+                **AI Hardware Advancements**: 
+                - Present major updates in AI-specific hardware, focusing on recent breakthroughs and trends:
+                    - Summarize upcoming releases or breakthroughs (e.g., new NVIDIA GPUs, Apple’s chips, advancements in edge AI hardware).
+                    - Provide performance comparisons to previous models to highlight improvements, efficiency gains, or scalability enhancements.
+                    - Include new use cases or efficiency gains expected from these advancements, and discuss how they reflect recent industry trends.
+                **Software Innovations**: 
+                - Outline cutting-edge software models and updates, including popular trends in AI applications:
+                    - Detail improvements in reasoning, multimodal capabilities, and efficiency with models like OpenAI’s GPT, Meta’s Llama, Google’s Gemini, and others that are driving new AI capabilities.
+                    - Emphasize recent developments in responsible AI, ethical AI practices, and any alignment improvements in popular models.
+                    - Include relevant benchmarks, unique features (such as increased context windows, enhanced image/video processing), and visual comparisons, highlighting recent improvements and trends.
+                **Open-Source Contributions**: 
+                - Showcase significant open-source AI releases, focusing on recent contributions and trends. Consider for example new open models and AI related frameworks. Consider LLMs and image generation models and other types when applicable.:
+                    - Highlight contributions from companies like Meta, Microsoft, Google, and others, explaining the anticipated impact and what is innovative about these tools.
+                    - Include real-world applications and potential impact, particularly in underrepresented regions or for solving specific societal challenges, showcasing the relevance to current global AI trends.
+                **Validation and Accuracy**: 
+                - Ensure all data points are accurate, verified, and from reputable sources. Avoid unverified claims by cross-referencing with multiple credible sources, primarily direct statements from the companies or technical documentation.
+            """
             main_question_id = insert_question(conn, question_text)
             main_answer = process_question(main_question_id, conn, cache)
             if main_answer:
