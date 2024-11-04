@@ -72,6 +72,11 @@ def init_db():
 
 def insert_question(conn, text, parent_id=None, status='pending', answer=None):
     cursor = conn.cursor()
+    # Check if the question already exists
+    cursor.execute('SELECT id FROM Questions WHERE text = ? AND parent_id = ?', (text, parent_id))
+    existing_question = cursor.fetchone()
+    if existing_question:
+        return existing_question[0]
     cursor.execute('''
         INSERT INTO Questions (text, parent_id, status, answer)
         VALUES (?, ?, ?, ?)
@@ -88,10 +93,18 @@ def update_question_status(conn, question_id, status, answer=None):
 
 def insert_task(conn, question_id, task_type, parameters, status='pending', outcome=None):
     cursor = conn.cursor()
+    parameters_json = json.dumps(parameters, sort_keys=True)
+    # Check if the task already exists
+    cursor.execute('''
+        SELECT id FROM Tasks WHERE question_id = ? AND task_type = ? AND parameters = ?
+    ''', (question_id, task_type, parameters_json))
+    existing_task = cursor.fetchone()
+    if existing_task:
+        return existing_task[0]
     cursor.execute('''
         INSERT INTO Tasks (question_id, task_type, parameters, status, outcome)
         VALUES (?, ?, ?, ?, ?)
-    ''', (question_id, task_type, json.dumps(parameters), status, json.dumps(outcome)))
+    ''', (question_id, task_type, parameters_json, status, json.dumps(outcome)))
     conn.commit()
     return cursor.lastrowid
 
@@ -183,6 +196,13 @@ def process_task(task, question_id, conn, cache):
     if existing_outcome is not None:
         logger.info(f"Using existing outcome for task '{task_name}' with parameters {parameters}")
         outcome = existing_outcome
+        # Update the task status to 'completed' if not already done
+        cursor = conn.cursor()
+        parameters_json = json.dumps(parameters, sort_keys=True)
+        cursor.execute('''
+            UPDATE Tasks SET status = ?, outcome = ? WHERE question_id = ? AND task_type = ? AND parameters = ?
+        ''', ('completed', json.dumps(outcome), question_id, task_name, parameters_json))
+        conn.commit()
     else:
         try:
             outcome = execute_task(task_name, parameters, cache)
@@ -199,7 +219,6 @@ def process_task(task, question_id, conn, cache):
     if 'error' in outcome:
         logger.error(f"Error in task '{task_name}': {outcome['error']}")
         # Decide how to handle the error
-        # For now, include the error in the sub_task_outcomes
         sub_task_outcomes.append({
             'task_name': task_name,
             'parameters': parameters,
@@ -249,7 +268,6 @@ def process_task(task, question_id, conn, cache):
                         'error': 'No structured data extracted'
                     })
         elif task_name == 'validate_fact':
-             # Check for errors in outcome
             if 'error' in outcome:
                 logger.error(f"Error in task '{task_name}': {outcome['error']}")
                 sub_task_outcomes.append({
@@ -258,11 +276,10 @@ def process_task(task, question_id, conn, cache):
                     "error": outcome['error']
                 })
             else:
-                # If outcome contains validation result, add it to sub_task_outcomes
                 is_true = outcome.get("is_true", False)
                 confidence = outcome.get("confidence", 0.0)
                 sources = outcome.get("sources", [])
-                
+
                 sub_task_outcomes.append({
                     "task_name": task_name,
                     "statement": parameters.get("statement"),
@@ -280,7 +297,7 @@ def process_task(task, question_id, conn, cache):
     }
 
 # Recursive question processing
-def process_question(question_id, conn, cache):
+def process_question(question_id, conn, cache, attempts=0, max_attempts=3):
     cursor = conn.cursor()
     cursor.execute('SELECT text, status, answer FROM Questions WHERE id = ?', (question_id,))
     question_row = cursor.fetchone()
@@ -295,6 +312,12 @@ def process_question(question_id, conn, cache):
     if status == 'answered' and existing_answer:
         logger.info(f"Question ID {question_id} is already answered.")
         return existing_answer
+
+    # If we have exceeded max attempts, stop processing
+    if attempts >= max_attempts:
+        logger.warning(f"Max attempts reached for question ID {question_id}.")
+        update_question_status(conn, question_id, 'unanswerable')
+        return None
 
     # Generate tasks, subquestions, and attempt to answer
     answer, tasks_to_perform, sub_questions = generate_tasks_and_subquestions(question_text, cache)
@@ -337,7 +360,7 @@ def process_question(question_id, conn, cache):
                 continue
         else:
             sub_question_id = insert_question(conn, sub_question_text, parent_id=question_id)
-        sub_answer = process_question(sub_question_id, conn, cache)
+        sub_answer = process_question(sub_question_id, conn, cache, attempts=attempts+1, max_attempts=max_attempts)
         if sub_answer:
             sub_answers.append(sub_answer)
         else:
@@ -354,9 +377,21 @@ def process_question(question_id, conn, cache):
         update_question_status(conn, question_id, 'answered', answer)
         return answer
     else:
-        # If still cannot answer, mark as pending
-        update_question_status(conn, question_id, 'pending')
-        return None
+        # Check if there are any pending tasks or subquestions
+        cursor.execute('SELECT COUNT(*) FROM Tasks WHERE question_id = ? AND status = ?', (question_id, 'pending'))
+        pending_tasks_count = cursor.fetchone()[0]
+
+        cursor.execute('SELECT COUNT(*) FROM Questions WHERE parent_id = ? AND status != ?', (question_id, 'answered'))
+        pending_subquestions_count = cursor.fetchone()[0]
+
+        if pending_tasks_count == 0 and pending_subquestions_count == 0:
+            logger.debug("No more pending tasks or subquestions, attempting to generate more.")
+            # Recurse with increased attempts
+            return process_question(question_id, conn, cache, attempts=attempts+1, max_attempts=max_attempts)
+        else:
+            logger.debug("There are still pending tasks or subquestions.")
+            # Return None to indicate that processing is ongoing
+            return None
 
 # Main execution flow
 if __name__ == '__main__':
@@ -365,27 +400,7 @@ if __name__ == '__main__':
     # Open a persistent cache with shelve
     with shelve.open(CACHE_FILE) as cache:
         try:
-            question_text = """**Objective**: Create an elaborate complete markdown report detailing advancements in artificial intelligence only in October 2024, covering hardware, software, open-source developments and emerging trends (focus multiple large companies have shown recently) from reputable and credible sources. Ensure the report highlights recent trends and innovations that reflect the latest industry shifts and focus areas. Each statement should include online references to credible sources. Structure the report to appeal to a broad audience, including both technical and strategic stakeholders. Each section should be engaging, visual, and supported by concrete data from authoritative sources, preferably the official announcements, technical documentation, or product pages of the service providers or manufacturers.
-                **AI Hardware Advancements**: 
-                - Present major updates in AI-specific hardware, focusing on recent breakthroughs and trends:
-                    - Summarize upcoming releases or breakthroughs (e.g., new NVIDIA GPUs, Apple’s chips, advancements in edge AI hardware).
-                    - Provide performance comparisons to previous models to highlight improvements, efficiency gains, or scalability enhancements.
-                    - Include new use cases or efficiency gains expected from these advancements, and discuss how they reflect recent industry trends.
-
-                **Software Innovations**: 
-                - Outline cutting-edge software models and updates, including popular trends in AI applications:
-                    - Detail improvements in reasoning, multimodal capabilities, and efficiency with models like OpenAI’s GPT, Meta’s Llama, Google’s Gemini, and others that are driving new AI capabilities.
-                    - Emphasize recent developments in responsible AI, ethical AI practices, and any alignment improvements in popular models.
-                    - Include relevant benchmarks, unique features (such as increased context windows, enhanced image/video processing), and visual comparisons, highlighting recent improvements and trends.
-
-                **Open-Source Contributions**: 
-                - Showcase significant open-source AI releases, focusing on recent contributions and trends. Consider for example new open models and AI related frameworks. Consider LLMs and image generation models and other types when applicable.:
-                    - Highlight contributions from companies like Meta, Microsoft, Google, and others, explaining the anticipated impact and what is innovative about these tools.
-                    - Include real-world applications and potential impact, particularly in underrepresented regions or for solving specific societal challenges, showcasing the relevance to current global AI trends.
-
-                **Validation and Accuracy**: 
-                - Ensure all data points are accurate, verified, and from reputable sources. Avoid unverified claims by cross-referencing with multiple credible sources, primarily direct statements from the companies or technical documentation.
-            """
+            question_text = """[Your question here]"""
             main_question_id = insert_question(conn, question_text)
             main_answer = process_question(main_question_id, conn, cache)
             if main_answer:
