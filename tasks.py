@@ -31,6 +31,11 @@ from utils import (
 )
 from urllib.parse import urlparse
 import re
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import random
+from lxml import html, etree
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -227,15 +232,25 @@ def extract_content(task_params, cache=None):
     if not url:
         logger.error("No URL provided for content extraction.")
         return {"error": "No URL provided for content extraction."}
+
+    # Try to fetch the URL via requests
     headers = {'User-Agent': 'Mozilla/5.0'}
+    response = None
     try:
         response = requests.get(url, headers=headers)
         response.raise_for_status()
         logger.debug(f"Successfully fetched URL: {url}")
+    except requests.RequestException as e:
+        logger.exception(f"RequestException occurred while fetching URL via requests: {url}")
+        response = None
 
-        # Capture a screenshot of the webpage
-        screenshot = capture_screenshot(url)
-        logger.debug("Captured screenshot of the webpage.")
+    # Initialize variables
+    page_source = None
+
+    # Capture a screenshot and get page source of the webpage
+    try:
+        screenshot, page_source = capture_screenshot(url)
+        logger.debug("Captured screenshot and page source of the webpage.")
 
         # Generate a unique filename using a hash of the URL
         parsed_url = urlparse(url)
@@ -306,19 +321,33 @@ def extract_content(task_params, cache=None):
 
             return {'structured_data': parsed_content_list}
         except Exception as e:
-            logger.exception("An error occurred during OCR and SOM processing. Falling back to BeautifulSoup.")
-            # If OmniParser fails, use BeautifulSoup to extract content
-            logger.debug("Using BeautifulSoup to extract content.")
-            soup = BeautifulSoup(response.content, 'html.parser')
-            # Extract text content
-            texts = soup.stripped_strings
-            text_content = ' '.join(texts)
-            logger.debug(f"Extracted text content length: {len(text_content)}")
+            logger.exception("An error occurred during OCR and SOM processing. Falling back to processing page source or response content.")
+
+            # Try to use page_source from Selenium
+            if page_source:
+                logger.debug("Using page source from Selenium to extract content.")
+                content_to_process = page_source
+            elif response is not None:
+                logger.debug("Using response content from requests to extract content.")
+                content_to_process = response.content
+            else:
+                logger.error("No content available to extract.")
+                return {'error': "No content available to extract."}
+
+            # Clean the content
+            cleaned_html = clean_html_content(content_to_process)
+            logger.debug("Cleaned HTML content.")
+
+            # Extract text from the cleaned html
+            text_content = extract_text_from_html(cleaned_html)
+            logger.debug("Extracted text from cleaned HTML.")
+
+            # Cleanup the extracted text
+            text_content = cleanup_extracted_text(text_content)
+            logger.debug("Cleaned up extracted text.")
+
             return {'structured_data': text_content}
 
-    except requests.RequestException as e:
-        logger.exception(f"RequestException occurred while fetching URL: {url}")
-        return {'error': f"Failed to fetch URL: {str(e)}"}
     except Exception as e:
         logger.exception("An error occurred in extract_content.")
         return {'error': f"An unexpected error occurred: {str(e)}"}
@@ -343,8 +372,40 @@ def capture_screenshot(url):
         driver.get(url)
         logger.debug("Navigated to URL.")
 
-        # Allow time for the page to load completely
-        time.sleep(3)  # Adjust sleep time as necessary
+        # Wait for the page to load completely
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+        logger.debug("Page loaded successfully.")
+
+        # Attempt to click away cookie banners
+        try:
+            cookie_buttons = WebDriverWait(driver, 5).until(
+                EC.presence_of_all_elements_located((
+                    By.XPATH,
+                    "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'agree') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'proceed') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'allow') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'consent') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'ok')]"
+                ))
+            )
+            for cookie_button in cookie_buttons:
+                try:
+                    if WebDriverWait(driver, 5).until(EC.element_to_be_clickable(cookie_button)):
+                        logger.debug("Found clickable cookie pop-up button, attempting to click it")
+                        cookie_button.click()
+                        logger.debug("Clicked cookie pop-up button, waiting for it to disappear")
+                        WebDriverWait(driver, 5).until(EC.invisibility_of_element(cookie_button))
+                        logger.debug("Cookie pop-up disappeared successfully")
+                except Exception as e:
+                    logger.debug(f"Could not click the button: {e}")
+        except Exception as e:
+            logger.debug(f"No cookie pop-up found or could not locate buttons: {e}")
+
+        # Allow time for the page to adjust after clicking banners
+        time.sleep(2)
+
+        # Get the page source
+        page_source = driver.page_source
+
+        # Now proceed to capture the screenshot as before
 
         # Calculate the total height of the page
         total_height = driver.execute_script("return document.body.scrollHeight")
@@ -368,7 +429,7 @@ def capture_screenshot(url):
         screenshot = driver.get_screenshot_as_png()
         logger.debug("Screenshot captured.")
 
-        return screenshot
+        return screenshot, page_source
     except Exception as e:
         logger.exception("An error occurred while capturing screenshot.")
         raise
@@ -376,6 +437,40 @@ def capture_screenshot(url):
         # Close the WebDriver
         driver.quit()
         logger.debug("WebDriver closed.")
+
+def clean_html_content(html_content):
+    from lxml import html, etree
+
+    soup = BeautifulSoup(html_content, 'html.parser')
+    for element in soup(['script', 'style', 'header', 'footer', 'nav', 'aside', 'form']):
+        element.extract()
+
+    for element in soup.find_all(attrs={"class": ["sidebar", "advertisement", "promo", "footer", "header"]}):
+        element.extract()
+    for element in soup.find_all(attrs={"id": ["sidebar", "advertisement", "promo", "footer", "header"]}):
+        element.extract()
+
+    cleaned_html = soup.prettify()
+    try:
+        tree = html.fromstring(cleaned_html)
+        for element in tree.xpath('//script|//style|//header|//footer|//nav|//aside|//form'):
+            element.drop_tree()
+
+        return etree.tostring(tree, method='html', encoding='unicode')
+    except Exception as e:
+        logger.error(f"Error in cleaning HTML: {e}")
+        return ""
+
+def extract_text_from_html(cleaned_html):
+    soup = BeautifulSoup(cleaned_html, 'html.parser')
+    return soup.get_text(separator='\n')
+
+def cleanup_extracted_text(text):
+    import re
+    text = re.sub(r'\n\s*\n', '\n\n', text)
+    text = '\n'.join([line.strip() for line in text.split('\n')])
+    text = re.sub(r'\s+', ' ', text)
+    return text
 
 def validate_fact(task_params, cache=None):
     statement = task_params.get('statement')

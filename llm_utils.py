@@ -63,6 +63,13 @@ def send_llm_request(prompt, cache, model_name, api_url, expect_json=True):
 
     except requests.exceptions.RequestException as e:
         logger.error(f"LLM request failed: {e}")
+        return "" if not expect_json else {}
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON response from accumulated response: {e}")
+        return "" if not expect_json else {}
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"LLM request failed: {e}")
         return "" if not expect_json else {}  # Return empty response on error
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse JSON response from accumulated response: {e}")
