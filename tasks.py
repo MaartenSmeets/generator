@@ -93,6 +93,8 @@ except OSError:
 
 OLLAMA_URL = "http://localhost:11434/api/generate"  # Replace with your actual endpoint
 SUMMARIZER_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Configurable summarizer model name
+IS_REPUTABLE_SOURCE_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Replace with your desired model name
+IS_CONTENT_VALUABLE_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Configurable model name for content validation
 
 # Define a dictionary to map task names to functions
 TASK_FUNCTIONS: Dict[str, Callable[[Dict[str, Any], Any], Dict[str, Any]]] = {}
@@ -112,7 +114,7 @@ def list_tasks() -> List[Dict[str, Any]]:
         {
             "name": "extract_content",
             "description": "Extract relevant content from a webpage.",
-            "parameters": ["url"],
+            "parameters": ["url", "question"],
             "outcomes": ["structured_data"]
         },
         {
@@ -124,7 +126,7 @@ def list_tasks() -> List[Dict[str, Any]]:
         {
             "name": "summarize_text",
             "description": "Generate a summary of the provided text.",
-            "parameters": ["text"],
+            "parameters": ["text", "question"],
             "outcomes": ["summary"]
         },
         {
@@ -168,6 +170,18 @@ def list_tasks() -> List[Dict[str, Any]]:
             "description": "Extract keywords or topics from the provided text.",
             "parameters": ["text"],
             "outcomes": ["keywords"]
+        },
+        {
+            "name": "is_reputable_source",
+            "description": "Determine if a URL is from a reputable source using LLM.",
+            "parameters": ["url"],
+            "outcomes": ["is_reputable"]
+        },
+        {
+            "name": "is_content_valuable",
+            "description": "Check if the extracted content is valuable for answering a question.",
+            "parameters": ["extracted_text", "question"],
+            "outcomes": ["is_valuable"]
         }
     ]
 
@@ -228,24 +242,18 @@ TASK_FUNCTIONS["search_query"] = search_query
 def extract_content(task_params, cache=None):
     import hashlib
     url = task_params.get('url')
+    question = task_params.get('question')
     logger.debug(f"Starting extract_content with URL: {url}")
     if not url:
         logger.error("No URL provided for content extraction.")
         return {"error": "No URL provided for content extraction."}
-
-    # Try to fetch the URL via requests
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    response = None
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        logger.debug(f"Successfully fetched URL: {url}")
-    except requests.RequestException as e:
-        logger.exception(f"RequestException occurred while fetching URL via requests: {url}")
-        response = None
+    if not question:
+        logger.error("No question provided for content extraction.")
+        return {'error': "No question provided for content extraction."}
 
     # Initialize variables
     page_source = None
+    response = None
 
     # Capture a screenshot and get page source of the webpage
     try:
@@ -319,40 +327,89 @@ def extract_content(task_params, cache=None):
             dino_labeled_img, label_coordinates, parsed_content_list = som_result
             logger.debug(f"Parsed content list length: {len(parsed_content_list)}")
 
-            return {'structured_data': parsed_content_list}
+            # Assign extracted text for validation
+            extracted_text = parsed_content_list
+
         except Exception as e:
-            logger.exception("An error occurred during OCR and SOM processing. Falling back to processing page source or response content.")
+            logger.exception("An error occurred during OCR processing. Falling back to processing page source or response content.")
 
             # Try to use page_source from Selenium
             if page_source:
                 logger.debug("Using page source from Selenium to extract content.")
                 content_to_process = page_source
-            elif response is not None:
-                logger.debug("Using response content from requests to extract content.")
-                content_to_process = response.content
+            else:
+                logger.debug("Fetching URL content via requests.")
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                try:
+                    response = requests.get(url, headers=headers)
+                    response.raise_for_status()
+                    logger.debug(f"Successfully fetched URL via requests: {url}")
+                    content_to_process = response.content
+                except requests.RequestException as e:
+                    logger.exception(f"Failed to fetch URL via requests: {url}")
+                    content_to_process = None
+
+            if content_to_process:
+                # Clean the content
+                cleaned_html = clean_html_content(content_to_process)
+                logger.debug("Cleaned HTML content.")
+
+                # Extract text from the cleaned html
+                text_content = extract_text_from_html(cleaned_html)
+                logger.debug("Extracted text from cleaned HTML.")
+
+                # Cleanup the extracted text
+                text_content = cleanup_extracted_text(text_content)
+                logger.debug("Cleaned up extracted text.")
+
+                # Assign extracted text for validation
+                extracted_text = text_content
             else:
                 logger.error("No content available to extract.")
                 return {'error': "No content available to extract."}
 
-            # Clean the content
-            cleaned_html = clean_html_content(content_to_process)
-            logger.debug("Cleaned HTML content.")
+        # Validate the extracted content using LLM via execute_task
+        is_valuable_result = execute_task("is_content_valuable", {"extracted_text": extracted_text, "question": question}, cache)
+        if not is_valuable_result.get("is_valuable"):
+            logger.debug("Extracted content is not valuable for answering the question.")
+            return {'error': "Extracted content is not valuable for answering the question."}
+        else:
+            logger.debug("Extracted content is valuable.")
 
-            # Extract text from the cleaned html
-            text_content = extract_text_from_html(cleaned_html)
-            logger.debug("Extracted text from cleaned HTML.")
-
-            # Cleanup the extracted text
-            text_content = cleanup_extracted_text(text_content)
-            logger.debug("Cleaned up extracted text.")
-
-            return {'structured_data': text_content}
+        # Proceed to return the structured data
+        return {'structured_data': extracted_text}
 
     except Exception as e:
         logger.exception("An error occurred in extract_content.")
         return {'error': f"An unexpected error occurred: {str(e)}"}
-
+ 
 TASK_FUNCTIONS["extract_content"] = extract_content
+
+def is_content_valuable(task_params, cache=None):
+    extracted_text = task_params.get('extracted_text')
+    question = task_params.get('question')
+    if not extracted_text or not question:
+        logger.error("Both 'extracted_text' and 'question' must be provided for content validation.")
+        return {"error": "Both 'extracted_text' and 'question' must be provided for content validation."}
+
+    logger.debug("Validating extracted content using LLM.")
+    prompt = (
+        "Determine whether the following content is valuable for answering the given question. "
+        "Content that is a denial, a warning notice, a cookie policy, or an empty page should be considered not valuable.\n\n"
+        f"Question:\n{question}\n\nContent:\n{extracted_text}\n\n"
+        "Is the content valuable for answering the question? Answer 'Yes' or 'No'."
+    )
+    try:
+        response = send_llm_request(prompt, cache, IS_CONTENT_VALUABLE_MODEL_NAME, OLLAMA_URL, expect_json=False)
+        answer = response.strip().lower()
+        logger.debug(f"LLM validation response: {answer}")
+        is_valuable = 'yes' in answer
+        return {"is_valuable": is_valuable}
+    except Exception as e:
+        logger.exception("An error occurred during content validation.")
+        return {"error": f"An error occurred during content validation: {str(e)}"}
+
+TASK_FUNCTIONS["is_content_valuable"] = is_content_valuable
 
 def capture_screenshot(url):
     logger.debug(f"Capturing screenshot for URL: {url}")
@@ -380,22 +437,39 @@ def capture_screenshot(url):
 
         # Attempt to click away cookie banners
         try:
+            # Find cookie buttons with refined criteria for "accept" and similar terms
             cookie_buttons = WebDriverWait(driver, 5).until(
                 EC.presence_of_all_elements_located((
                     By.XPATH,
-                    "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'agree') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'proceed') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'allow') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'consent') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'ok')]"
+                    "//*[(@role='button' or @type='button' or @class) and "
+                    "(contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept') or "
+                    "contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'agree') or "
+                    "contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'proceed') or "
+                    "contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'allow') or "
+                    "contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'consent') or "
+                    "contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'ok') or "
+                    "contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue') or "
+                    "contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'save changes'))]"
                 ))
             )
+
+            # Attempt to click only the first visible and clickable button
             for cookie_button in cookie_buttons:
                 try:
-                    if WebDriverWait(driver, 5).until(EC.element_to_be_clickable(cookie_button)):
-                        logger.debug("Found clickable cookie pop-up button, attempting to click it")
+                    # Check if the button is visible and clickable
+                    if WebDriverWait(driver, 5).until(EC.visibility_of(cookie_button)) and \
+                       WebDriverWait(driver, 5).until(EC.element_to_be_clickable(cookie_button)):
+                        # Simulate realistic mouse movement and randomized delay
+                        simulate_human_mouse_movement(driver, cookie_button)
+                        logger.debug("Found clickable, visible cookie pop-up button, attempting to click it")
                         cookie_button.click()
-                        logger.debug("Clicked cookie pop-up button, waiting for it to disappear")
+
+                        # Wait for it to disappear to confirm it's the correct button
                         WebDriverWait(driver, 5).until(EC.invisibility_of_element(cookie_button))
                         logger.debug("Cookie pop-up disappeared successfully")
+                        break  # Exit after successfully handling one cookie banner
                 except Exception as e:
-                    logger.debug(f"Could not click the button: {e}")
+                    logger.debug(f"Could not click the button or button did not disappear: {e}")
         except Exception as e:
             logger.debug(f"No cookie pop-up found or could not locate buttons: {e}")
 
@@ -438,6 +512,47 @@ def capture_screenshot(url):
         driver.quit()
         logger.debug("WebDriver closed.")
 
+def simulate_human_mouse_movement(driver, element):
+    from selenium.webdriver.common.action_chains import ActionChains
+    import numpy as np
+
+    try:
+        # Get the location and size of the element
+        location = element.location_once_scrolled_into_view
+        size = element.size
+
+        # Calculate the center of the element
+        end_x = location['x'] + size['width'] / 2
+        end_y = location['y'] + size['height'] / 2
+
+        # Starting point (you can set this to the current mouse position if available)
+        start_x = random.randint(0, driver.execute_script("return window.innerWidth"))
+        start_y = random.randint(0, driver.execute_script("return window.innerHeight"))
+
+        # Generate a list of points simulating a human-like mouse movement
+        num_points = random.randint(10, 20)
+        x_points = np.linspace(start_x, end_x, num_points) + np.random.normal(0, 5, num_points)
+        y_points = np.linspace(start_y, end_y, num_points) + np.random.normal(0, 5, num_points)
+
+        actions = ActionChains(driver)
+        actions.move_by_offset(start_x, start_y)
+
+        for x, y in zip(x_points, y_points):
+            actions.move_by_offset(x - start_x, y - start_y)
+            start_x, start_y = x, y
+            # Random small delay between movements
+            time.sleep(random.uniform(0.01, 0.05))
+
+        # Randomized delay before clicking
+        time.sleep(random.uniform(0.5, 1.5))
+        actions.click(on_element=element)
+        actions.perform()
+        logger.debug("Simulated human mouse movement and clicked the element.")
+    except Exception as e:
+        logger.exception("An error occurred during mouse movement simulation.")
+        # If simulation fails, proceed without it
+        pass
+
 def clean_html_content(html_content):
     from lxml import html, etree
 
@@ -479,27 +594,41 @@ def validate_fact(task_params, cache=None):
         logger.error("No statement provided for validation.")
         return {"error": "No statement provided for validation."}
 
-    # Step 1: Perform a search query to find relevant pages
+    # Step 1: Extract entities from the statement
+    try:
+        doc = nlp(statement)
+        entities = [ent.text for ent in doc.ents if ent.label_ in ('ORG', 'GPE', 'PERSON', 'PRODUCT')]
+    except Exception as e:
+        logger.exception("An error occurred while extracting entities from the statement.")
+        entities = []
+
+    # Step 2: Perform a search query to find relevant pages
     search_results = search_query({'query': statement})
     if 'error' in search_results:
         logger.error(f"Failed to retrieve search results: {search_results['error']}")
         return {"error": f"Failed to retrieve search results: {search_results['error']}"}
 
-    # Step 2: Extract content from each search result
+    # Step 3: Extract content from each search result
     verified_sources = []
     for result in search_results.get('search_results', []):
         url = result.get('url')
-        content_result = extract_content({'url': url})
 
-        if 'structured_data' in content_result:
-            page_content = content_result['structured_data']
-            page_content_str = json.dumps(page_content).lower()
-            if statement.lower() in page_content_str:
-                verified_sources.append(url)
-        elif 'error' in content_result:
-            logger.error(f"Error extracting content from URL {url}: {content_result['error']}")
+        # Check if the URL is from a reputable source using execute_task
+        reputable_result = execute_task("is_reputable_source", {"url": url}, cache)
+        if reputable_result.get("is_reputable"):
+            content_result = extract_content({'url': url, 'question': statement}, cache)
 
-    # Step 3: Calculate confidence based on verified sources
+            if 'structured_data' in content_result:
+                page_content = content_result['structured_data']
+                page_content_str = json.dumps(page_content).lower()
+                if statement.lower() in page_content_str:
+                    verified_sources.append(url)
+            elif 'error' in content_result:
+                logger.error(f"Error extracting content from URL {url}: {content_result['error']}")
+        else:
+            logger.debug(f"Skipping non-reputable source: {url}")
+
+    # Step 4: Calculate confidence based on verified sources
     is_true = bool(verified_sources)
     confidence = min(1.0, 0.2 + len(verified_sources) * 0.2)  # Confidence increases with more sources
 
@@ -511,18 +640,50 @@ def validate_fact(task_params, cache=None):
 
 TASK_FUNCTIONS["validate_fact"] = validate_fact
 
+def is_reputable_source(task_params, cache=None):
+    url = task_params.get('url')
+    if not url:
+        logger.error("No URL provided for reputation check.")
+        return {"error": "No URL provided for reputation check."}
+
+    logger.debug(f"Checking if URL is from a reputable source: {url}")
+
+    # Construct prompt for LLM
+    prompt = (
+        "Determine whether the following URL is from a reputable and credible source. "
+        "Consider international government sites, major tech companies like Microsoft, Apple, Nvidia, universities, "
+        "and reputable news outlets like BBC as reputable sources. Do not consider sources known for fake news like Fox News as reputable. "
+        "Answer 'Yes' if the source is reputable, or 'No' if not.\n\n"
+        f"URL: {url}\n\nIs this a reputable source?"
+    )
+
+    try:
+        response = send_llm_request(prompt, cache, IS_REPUTABLE_SOURCE_MODEL_NAME, OLLAMA_URL, expect_json=False)
+        answer = response.strip().lower()
+        logger.debug(f"LLM response for is_reputable_source: {answer}")
+        is_reputable = 'yes' in answer
+        return {"is_reputable": is_reputable}
+    except Exception as e:
+        logger.exception("An error occurred during source reputation check.")
+        return {"error": f"An error occurred during source reputation check: {str(e)}"}
+
+TASK_FUNCTIONS["is_reputable_source"] = is_reputable_source
+
 def summarize_text(task_params, cache=None):
     text = task_params.get('text', '')
+    question = task_params.get('question')
     logger.debug("Summarizing text.")
     if not text:
         logger.error("No text provided for summarization.")
         return {"error": "No text provided for summarization."}
+    if not question:
+        logger.error("No question provided for summarization.")
+        return {"error": "No question provided for summarization."}
 
     prompt = (
-        "Provide a summary of the following text, focusing only on the main points and key information. "
-        "Do not include any introductions, comments about the summarization process, or closing remarks. "
-        "If the content is messy, focus on the information you can obtain, considering the page is likely focused on a single topic.\n\n"
-        f"{text}\n\nSummary:"
+        "Provide a summary of the following text, focusing on relevant information for answering the given question. "
+        "Do not include any introductions, comments about the summarization process, or closing remarks.\n\n"
+        f"Question:\n{question}\n\nText:\n{text}\n\nSummary:"
     )
 
     try:
@@ -668,3 +829,17 @@ def extract_keywords(task_params, cache=None):
         return {"error": f"An error occurred while extracting keywords: {str(e)}"}
 TASK_FUNCTIONS["extract_keywords"] = extract_keywords
 
+def execute_task(task_name, parameters, cache=None):
+    task_function = TASK_FUNCTIONS.get(task_name)
+
+    # Log task_name and parameters to debug
+    logger.debug(f"Executing task: {task_name}, with parameters: {parameters}")
+    if not isinstance(parameters, dict):
+        logger.error(f"Expected parameters to be a dictionary, got {type(parameters)}")
+        raise TypeError(f"Expected parameters to be a dictionary, got {type(parameters)}")
+
+    if task_function:
+        return task_function(parameters, cache)
+    else:
+        logger.error(f"No function found for task: {task_name}")
+        raise ValueError(f"No function found for task: {task_name}")

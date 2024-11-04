@@ -16,7 +16,8 @@ OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 OLLAMA_URL = "http://localhost:11434/api/generate"  # Replace with your actual endpoint
-MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Replace with your actual model name
+TASK_GENERATION_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for task generation
+ANSWER_GENERATION_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for answer generation
 DATABASE_FILE = os.path.join(OUTPUT_DIR, 'tasks.db')
 CACHE_FILE = os.path.join(OUTPUT_DIR, 'cache.db')
 LOG_FILE = os.path.join(OUTPUT_DIR, 'generator.log')
@@ -146,7 +147,7 @@ def generate_tasks_and_subquestions(question_text, cache):
         }
     }
     prompt_str = json.dumps(prompt)
-    response = send_llm_request(prompt_str, cache, MODEL_NAME, OLLAMA_URL)
+    response = send_llm_request(prompt_str, cache, TASK_GENERATION_MODEL_NAME, OLLAMA_URL, expect_json=True)
     # Extract answer, tasks, and subquestions
     answer = response.get("answer", "")
     tasks_data = response.get("tasks", [])
@@ -165,7 +166,7 @@ def generate_answer_from_context(context, cache):
         }
     }
     prompt_str = json.dumps(prompt)
-    response = send_llm_request(prompt_str, cache, MODEL_NAME, OLLAMA_URL)
+    response = send_llm_request(prompt_str, cache, ANSWER_GENERATION_MODEL_NAME, OLLAMA_URL, expect_json=True)
     answer = response.get('answer', "")
     return answer
 
@@ -185,11 +186,14 @@ def execute_task(task_name, parameters, cache=None):
         logger.error(f"No function found for task: {task_name}")
         raise ValueError(f"No function found for task: {task_name}")
 
-def process_task(task, question_id, conn, cache):
+def process_task(task, question_id, question_text, conn, cache):
     task_name = task.get("name")
     parameters = task.get("parameters", {})
 
     logger.debug(f"Processing task '{task_name}' with parameters {parameters}")
+
+    # Add the question to the parameters if not already present
+    parameters.setdefault('question', question_text)
 
     # Check if the task has already been performed with the same parameters
     existing_outcome = get_existing_task_outcome(conn, task_name, parameters)
@@ -212,6 +216,9 @@ def process_task(task, question_id, conn, cache):
         except Exception as e:
             logger.exception(f"Error executing task '{task_name}' with parameters {parameters}: {e}")
             outcome = {'error': str(e)}
+            # Insert the task with the error
+            task_id = insert_task(conn, question_id, task_name, parameters, status='failed', outcome=outcome)
+            update_task_status(conn, task_id, 'failed', outcome)
 
     # Now, depending on the task and outcome, generate further tasks
     sub_task_outcomes = []
@@ -232,9 +239,9 @@ def process_task(task, question_id, conn, cache):
                 url = result.get('url')
                 sub_task = {
                     'name': 'extract_content',
-                    'parameters': {'url': url}
+                    'parameters': {'url': url, 'question': question_text}
                 }
-                sub_outcome = process_task(sub_task, question_id, conn, cache)
+                sub_outcome = process_task(sub_task, question_id, question_text, conn, cache)
                 if 'error' in sub_outcome.get('outcome', {}):
                     logger.error(f"Error in sub-task 'extract_content': {sub_outcome['outcome']['error']}")
                     sub_task_outcomes.append({
@@ -246,9 +253,9 @@ def process_task(task, question_id, conn, cache):
                 if structured_data:
                     summarize_task = {
                         'name': 'summarize_text',
-                        'parameters': {'text': json.dumps(structured_data)}
+                        'parameters': {'text': structured_data, 'question': question_text}
                     }
-                    summary_outcome = process_task(summarize_task, question_id, conn, cache)
+                    summary_outcome = process_task(summarize_task, question_id, question_text, conn, cache)
                     if 'error' in summary_outcome.get('outcome', {}):
                         logger.error(f"Error in sub-task 'summarize_text': {summary_outcome['outcome']['error']}")
                         sub_task_outcomes.append({
@@ -295,7 +302,7 @@ def process_task(task, question_id, conn, cache):
         'outcome': outcome,
         'sub_tasks': sub_task_outcomes
     }
-
+    
 # Recursive question processing
 def process_question(question_id, conn, cache, attempts=0, max_attempts=3):
     cursor = conn.cursor()
@@ -337,7 +344,7 @@ def process_question(question_id, conn, cache, attempts=0, max_attempts=3):
     # Process tasks recursively
     for task in tasks_to_perform:
         try:
-            outcome = process_task(task, question_id, conn, cache)
+            outcome = process_task(task, question_id, question_text, conn, cache)
             task_outcomes.append(outcome)
         except Exception as e:
             logger.exception(f"Error processing task {task}: {e}")
