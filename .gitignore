@@ -25,6 +25,8 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+weights/
+serper_api_key.txt
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
