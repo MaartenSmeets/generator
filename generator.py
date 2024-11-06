@@ -1,135 +1,66 @@
 # generator.py
-import sqlite3
+
 import json
 import os
 import logging
-import requests
-import hashlib
-import re
 import shelve
-import tasks
-from typing import List, Dict, Any, Union, Callable
+import sqlite3
+from typing import List, Dict, Any, Optional
+import tasks  # Import the tasks module
+import database  # Import the new database module
 from llm_utils import send_llm_request
 
-# Define constants and output directory
-OUTPUT_DIR = "output"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# -------------------- Logging Configuration --------------------
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Create handlers if they don't already exist
+if not logger.handlers:
+    # Define the output directory
+    OUTPUT_DIR = "output"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # Define the path for the log file
+    LOG_FILE = os.path.join(OUTPUT_DIR, 'generator.log')
+    
+    # Create a file handler
+    file_handler = logging.FileHandler(LOG_FILE)
+    file_handler.setLevel(logging.DEBUG)
+    
+    # Create a console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
+    
+    # Define logging format
+    formatter = logging.Formatter('%(asctime)s %(levelname)s:%(message)s')
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    # Add handlers to the logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+# -------------------- Constants --------------------
 
 OLLAMA_URL = "http://localhost:11434/api/generate"  # Replace with your actual endpoint
 TASK_GENERATION_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for task generation
 ANSWER_GENERATION_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for answer generation
-DATABASE_FILE = os.path.join(OUTPUT_DIR, 'tasks.db')
-CACHE_FILE = os.path.join(OUTPUT_DIR, 'cache.db')
-LOG_FILE = os.path.join(OUTPUT_DIR, 'generator.log')
+CACHE_FILE = os.path.join("output", 'cache.db')
 
-# Configure logging
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+# -------------------- Task and Sub-question Generation Functions --------------------
 
-# Create handlers
-file_handler = logging.FileHandler(LOG_FILE)
-file_handler.setLevel(logging.DEBUG)
+def generate_tasks_and_subquestions(question_text: str, cache: Any) -> (str, List[Dict[str, Any]], List[str]):
+    """
+    Generate tasks and sub-questions based on the main question.
 
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)
+    Args:
+        question_text (str): The main question text.
+        cache (Any): The cache object.
 
-# Create formatters and add to handlers
-formatter = logging.Formatter('%(asctime)s %(levelname)s:%(message)s')
-file_handler.setFormatter(formatter)
-console_handler.setFormatter(formatter)
-
-# Add handlers to logger
-if not logger.handlers:
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-
-# Database functions
-def init_db():
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS Questions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            parent_id INTEGER,
-            text TEXT NOT NULL,
-            status TEXT NOT NULL,
-            answer TEXT,
-            FOREIGN KEY(parent_id) REFERENCES Questions(id)
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS Tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            question_id INTEGER NOT NULL,
-            task_type TEXT NOT NULL,
-            parameters TEXT,
-            status TEXT NOT NULL,
-            outcome TEXT,
-            FOREIGN KEY(question_id) REFERENCES Questions(id)
-        )
-    ''')
-    conn.commit()
-    return conn
-
-def insert_question(conn, text, parent_id=None, status='pending', answer=None):
-    cursor = conn.cursor()
-    # Check if the question already exists
-    cursor.execute('SELECT id FROM Questions WHERE text = ? AND parent_id = ?', (text, parent_id))
-    existing_question = cursor.fetchone()
-    if existing_question:
-        return existing_question[0]
-    cursor.execute('''
-        INSERT INTO Questions (text, parent_id, status, answer)
-        VALUES (?, ?, ?, ?)
-    ''', (text, parent_id, status, answer))
-    conn.commit()
-    return cursor.lastrowid
-
-def update_question_status(conn, question_id, status, answer=None):
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE Questions SET status = ?, answer = ? WHERE id = ?
-    ''', (status, answer, question_id))
-    conn.commit()
-
-def insert_task(conn, question_id, task_type, parameters, status='pending', outcome=None):
-    cursor = conn.cursor()
-    parameters_json = json.dumps(parameters, sort_keys=True)
-    # Check if the task already exists
-    cursor.execute('''
-        SELECT id FROM Tasks WHERE question_id = ? AND task_type = ? AND parameters = ?
-    ''', (question_id, task_type, parameters_json))
-    existing_task = cursor.fetchone()
-    if existing_task:
-        return existing_task[0]
-    cursor.execute('''
-        INSERT INTO Tasks (question_id, task_type, parameters, status, outcome)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (question_id, task_type, parameters_json, status, json.dumps(outcome)))
-    conn.commit()
-    return cursor.lastrowid
-
-def update_task_status(conn, task_id, status, outcome=None):
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE Tasks SET status = ?, outcome = ? WHERE id = ?
-    ''', (status, json.dumps(outcome), task_id))
-    conn.commit()
-
-def get_existing_task_outcome(conn, task_type, parameters):
-    cursor = conn.cursor()
-    parameters_json = json.dumps(parameters, sort_keys=True)
-    cursor.execute('''
-        SELECT outcome FROM Tasks
-        WHERE task_type = ? AND parameters = ? AND status = 'completed'
-    ''', (task_type, parameters_json))
-    row = cursor.fetchone()
-    if row:
-        return json.loads(row[0]) if row[0] else None
-    return None
-
-# Define task and sub-question generation functions with structured output
-def generate_tasks_and_subquestions(question_text, cache):
+    Returns:
+        Tuple[str, List[Dict[str, Any]], List[str]]: A tuple containing the answer, list of tasks, and list of sub-questions.
+    """
     task_list = tasks.list_tasks()
     logger.debug(f"Generating tasks and subquestions for question: {question_text}")
     prompt = {
@@ -154,13 +85,24 @@ def generate_tasks_and_subquestions(question_text, cache):
     sub_questions = response.get("subquestions", [])
     return answer, tasks_data, sub_questions
 
-def generate_answer_from_context(context, cache):
+def generate_answer_from_context(context: Dict[str, Any], cache: Any) -> str:
+    """
+    Generate an answer based on the provided context.
+
+    Args:
+        context (Dict[str, Any]): The context containing question, tasks, and sub-answers.
+        cache (Any): The cache object.
+
+    Returns:
+        str: The generated answer.
+    """
     logger.debug("Generating answer from context.")
     prompt = {
         "answer_generation": {
             "description": (
                 "Based on the provided context, which includes the question, tasks with their parameters and outcomes, and sub-answers, generate an answer to the question. "
-                "Ensure all sources are verified and include concrete URL references. Return ONLY valid JSON with one key: 'answer' (a string). No additional text or explanations."
+                "Ensure all sources are verified and include concrete URL references. "
+                "Return ONLY valid JSON with one key: 'answer' (a string). No additional text or explanations."
             ),
             "parameters": context
         }
@@ -170,23 +112,76 @@ def generate_answer_from_context(context, cache):
     answer = response.get('answer', "")
     return answer
 
-# Task Execution
-def execute_task(task_name, parameters, cache=None):
-    task_function = tasks.TASK_FUNCTIONS.get(task_name)
+def generate_initial_tasks(question_text: str, keywords: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """
+    Generate the initial set of tasks based on the main question and extracted keywords.
 
-    # Log task_name and parameters to debug
-    logger.debug(f"Executing task: {task_name}, with parameters: {parameters}")
-    if not isinstance(parameters, dict):
-        logger.error(f"Expected parameters to be a dictionary, got {type(parameters)}")
-        raise TypeError(f"Expected parameters to be a dictionary, got {type(parameters)}")
+    Args:
+        question_text (str): The main question text.
+        keywords (Optional[List[str]], optional): Extracted keywords from the question. Defaults to None.
 
-    if task_function:
-        return task_function(parameters, cache)
+    Returns:
+        List[Dict[str, Any]]: A list of initial tasks to perform.
+    """
+    logger.debug(f"Generating initial tasks for question: {question_text}")
+    # The initial task is to perform a search query with the keywords as the query
+    if keywords:
+        query = ' '.join(keywords)
     else:
-        logger.error(f"No function found for task: {task_name}")
-        raise ValueError(f"No function found for task: {task_name}")
+        query = question_text
+    tasks_to_perform = [
+        {
+            "name": "search_query",
+            "parameters": {"query": query}
+        }
+    ]
+    return tasks_to_perform
 
-def process_task(task, question_id, question_text, conn, cache):
+def generate_subquestions(question_text: str, cache: Any) -> List[str]:
+    """
+    Generate sub-questions to further break down the main question.
+
+    Args:
+        question_text (str): The main question text.
+        cache (Any): The cache object.
+
+    Returns:
+        List[str]: A list of sub-questions.
+    """
+    logger.debug(f"Generating subquestions for question: {question_text}")
+    prompt = {
+        "subquestion_generation": {
+            "description": (
+                "Please analyze the question below and decompose it into smaller, more specific sub-questions that can help in answering the main question comprehensively. "
+                "Return ONLY valid JSON with one key: 'subquestions' (a list of strings). No additional text or explanations."
+            ),
+            "parameters": {"question": question_text}
+        }
+    }
+    prompt_str = json.dumps(prompt)
+    response = send_llm_request(prompt_str, cache, TASK_GENERATION_MODEL_NAME, OLLAMA_URL, expect_json=True)
+    sub_questions = response.get("subquestions", [])
+    return sub_questions
+
+# -------------------- Task Execution --------------------
+
+def process_task(task: Dict[str, Any], question_id: int, question_text: str, conn: sqlite3.Connection, cache: Any) -> Dict[str, Any]:
+    """
+    Process a single task:
+    - Check if the task outcome is cached.
+    - If not, execute the task using tasks.execute_task.
+    - Handle outcomes and potential sub-tasks.
+
+    Args:
+        task (Dict[str, Any]): The task dictionary containing 'name' and 'parameters'.
+        question_id (int): The ID of the associated question.
+        question_text (str): The text of the main question.
+        conn (sqlite3.Connection): The database connection object.
+        cache (Any): The cache object.
+
+    Returns:
+        Dict[str, Any]: The outcome of the task, including any sub-task outcomes.
+    """
     task_name = task.get("name")
     parameters = task.get("parameters", {})
 
@@ -196,7 +191,7 @@ def process_task(task, question_id, question_text, conn, cache):
     parameters.setdefault('question', question_text)
 
     # Check if the task has already been performed with the same parameters
-    existing_outcome = get_existing_task_outcome(conn, task_name, parameters)
+    existing_outcome = database.get_existing_task_outcome(conn, task_name, parameters)
     if existing_outcome is not None:
         logger.info(f"Using existing outcome for task '{task_name}' with parameters {parameters}")
         outcome = existing_outcome
@@ -209,16 +204,17 @@ def process_task(task, question_id, question_text, conn, cache):
         conn.commit()
     else:
         try:
-            outcome = execute_task(task_name, parameters, cache)
+            # Delegate task execution to tasks.py
+            outcome = tasks.execute_task(task_name, parameters, cache)
             # Insert the task with the outcome
-            task_id = insert_task(conn, question_id, task_name, parameters, status='completed', outcome=outcome)
-            update_task_status(conn, task_id, 'completed', outcome)
+            task_id = database.insert_task(conn, question_id, task_name, parameters, status='completed', outcome=outcome)
+            database.update_task_status(conn, task_id, 'completed', outcome)
         except Exception as e:
             logger.exception(f"Error executing task '{task_name}' with parameters {parameters}: {e}")
             outcome = {'error': str(e)}
             # Insert the task with the error
-            task_id = insert_task(conn, question_id, task_name, parameters, status='failed', outcome=outcome)
-            update_task_status(conn, task_id, 'failed', outcome)
+            task_id = database.insert_task(conn, question_id, task_name, parameters, status='failed', outcome=outcome)
+            database.update_task_status(conn, task_id, 'failed', outcome)
 
     # Now, depending on the task and outcome, generate further tasks
     sub_task_outcomes = []
@@ -302,9 +298,23 @@ def process_task(task, question_id, question_text, conn, cache):
         'outcome': outcome,
         'sub_tasks': sub_task_outcomes
     }
-    
-# Recursive question processing
-def process_question(question_id, conn, cache, attempts=0, max_attempts=3):
+
+# -------------------- Recursive Question Processing --------------------
+
+def process_question(question_id: int, conn: sqlite3.Connection, cache: Any, attempts: int = 0, max_attempts: int = 3) -> Optional[str]:
+    """
+    Recursively process a question by executing tasks and handling sub-questions.
+
+    Args:
+        question_id (int): The ID of the question to process.
+        conn (sqlite3.Connection): The database connection object.
+        cache (Any): The cache object.
+        attempts (int, optional): Current attempt count. Defaults to 0.
+        max_attempts (int, optional): Maximum allowed attempts. Defaults to 3.
+
+    Returns:
+        Optional[str]: The answer to the question if found, else None.
+    """
     cursor = conn.cursor()
     cursor.execute('SELECT text, status, answer FROM Questions WHERE id = ?', (question_id,))
     question_row = cursor.fetchone()
@@ -323,39 +333,80 @@ def process_question(question_id, conn, cache, attempts=0, max_attempts=3):
     # If we have exceeded max attempts, stop processing
     if attempts >= max_attempts:
         logger.warning(f"Max attempts reached for question ID {question_id}.")
-        update_question_status(conn, question_id, 'unanswerable')
+        database.update_question_status(conn, question_id, 'unanswerable')
         return None
 
-    # Generate tasks, subquestions, and attempt to answer
-    answer, tasks_to_perform, sub_questions = generate_tasks_and_subquestions(question_text, cache)
+    # Initialize task outcomes and sub_answers
+    task_outcomes = []
+    sub_answers = []
 
-    logger.debug(f"Generated answer: {answer}")
-    logger.debug(f"Generated tasks: {tasks_to_perform}")
+    # Step 1: Extract keywords from the question
+    keyword_task = {
+        "name": "extract_keywords",
+        "parameters": {"text": question_text}
+    }
+    keyword_outcome = process_task(keyword_task, question_id, question_text, conn, cache)
+    if 'error' in keyword_outcome.get('outcome', {}):
+        logger.error(f"Error extracting keywords: {keyword_outcome['outcome']['error']}")
+        database.update_question_status(conn, question_id, 'unanswerable')
+        return None
+    keywords = keyword_outcome.get('outcome', {}).get('keywords', [])
+    logger.debug(f"Extracted keywords: {keywords}")
+
+    # Step 2: Evaluate if the question is focused
+    evaluate_task = {
+        "name": "evaluate_question_focus",
+        "parameters": {"question": question_text}
+    }
+    evaluate_outcome = process_task(evaluate_task, question_id, question_text, conn, cache)
+    if 'error' in evaluate_outcome.get('outcome', {}):
+        logger.error(f"Error evaluating question focus: {evaluate_outcome['outcome']['error']}")
+        database.update_question_status(conn, question_id, 'unanswerable')
+        return None
+    is_focused = evaluate_outcome.get('outcome', {}).get('is_focused', False)
+    logger.debug(f"Is the question focused? {is_focused}")
+
+    if is_focused:
+        # Proceed with generating initial tasks based on keywords
+        tasks_to_perform = generate_initial_tasks(question_text, keywords=keywords)
+        logger.debug(f"Generated initial tasks based on keywords: {tasks_to_perform}")
+
+        # Process tasks recursively
+        for task in tasks_to_perform:
+            try:
+                outcome = process_task(task, question_id, question_text, conn, cache)
+                task_outcomes.append(outcome)
+            except Exception as e:
+                logger.exception(f"Error processing task {task}: {e}")
+                task_outcomes.append({
+                    'task_name': task.get('name'),
+                    'parameters': task.get('parameters'),
+                    'error': str(e)
+                })
+
+        # Attempt to generate an answer from the context
+        combined_context = {
+            'question': question_text,
+            'tasks': task_outcomes,
+            'sub_answers': sub_answers  # Empty at this point
+        }
+        answer = generate_answer_from_context(combined_context, cache)
+        if answer:
+            database.update_question_status(conn, question_id, 'answered', answer)
+            return answer
+
+        # If unable to generate answer, generate subquestions
+        logger.debug("Unable to generate answer from initial tasks, generating subquestions.")
+
+    else:
+        # If question is not focused, generate subquestions first
+        logger.debug("Question is not focused. Generating subquestions.")
+
+    # Generate subquestions regardless of focus
+    sub_questions = generate_subquestions(question_text, cache)
     logger.debug(f"Generated sub-questions: {sub_questions}")
 
-    # If answer is provided, update question and return
-    if answer:
-        update_question_status(conn, question_id, 'answered', answer)
-        return answer
-
-    # Initialize task outcomes
-    task_outcomes = []
-
-    # Process tasks recursively
-    for task in tasks_to_perform:
-        try:
-            outcome = process_task(task, question_id, question_text, conn, cache)
-            task_outcomes.append(outcome)
-        except Exception as e:
-            logger.exception(f"Error processing task {task}: {e}")
-            task_outcomes.append({
-                'task_name': task.get('name'),
-                'parameters': task.get('parameters'),
-                'error': str(e)
-            })
-
     # Process sub-questions
-    sub_answers = []
     for sub_question_text in sub_questions:
         # Check if sub-question already exists to avoid duplicates
         cursor.execute('SELECT id, status, answer FROM Questions WHERE text = ? AND parent_id = ?', (sub_question_text, question_id))
@@ -366,14 +417,14 @@ def process_question(question_id, conn, cache, attempts=0, max_attempts=3):
                 sub_answers.append(sub_answer)
                 continue
         else:
-            sub_question_id = insert_question(conn, sub_question_text, parent_id=question_id)
+            sub_question_id = database.insert_question(conn, sub_question_text, parent_id=question_id)
         sub_answer = process_question(sub_question_id, conn, cache, attempts=attempts+1, max_attempts=max_attempts)
         if sub_answer:
             sub_answers.append(sub_answer)
         else:
             sub_answers.append(f"Could not find an answer to sub-question: {sub_question_text}")
 
-    # After processing tasks and subquestions, attempt to answer the question using the collected information
+    # After processing subquestions, attempt to generate an answer using the collected information
     combined_context = {
         'question': question_text,
         'tasks': task_outcomes,
@@ -381,7 +432,7 @@ def process_question(question_id, conn, cache, attempts=0, max_attempts=3):
     }
     answer = generate_answer_from_context(combined_context, cache)
     if answer:
-        update_question_status(conn, question_id, 'answered', answer)
+        database.update_question_status(conn, question_id, 'answered', answer)
         return answer
     else:
         # Check if there are any pending tasks or subquestions
@@ -400,39 +451,34 @@ def process_question(question_id, conn, cache, attempts=0, max_attempts=3):
             # Return None to indicate that processing is ongoing
             return None
 
-# Main execution flow
+# -------------------- Main Execution Flow --------------------
+
 if __name__ == '__main__':
-    conn = init_db()
+    # Initialize the database
+    conn = database.init_db()
 
     # Open a persistent cache with shelve
     with shelve.open(CACHE_FILE) as cache:
         try:
-            question_text = question_text = """**Objective**: Create an elaborate complete markdown report detailing advancements in artificial intelligence only in October 2024, covering hardware, software, open-source developments and emerging trends (focus multiple large companies have shown recently) from reputable and credible sources. Ensure the report highlights recent trends and innovations that reflect the latest industry shifts and focus areas. Each statement should include online references to credible sources. Structure the report to appeal to a broad audience, including both technical and strategic stakeholders. Each section should be engaging, visual, and supported by concrete data from authoritative sources, preferably the official announcements, technical documentation, or product pages of the service providers or manufacturers.
-                **AI Hardware Advancements**: 
-                - Present major updates in AI-specific hardware, focusing on recent breakthroughs and trends:
-                    - Summarize upcoming releases or breakthroughs (e.g., new NVIDIA GPUs, Apple’s chips, advancements in edge AI hardware).
-                    - Provide performance comparisons to previous models to highlight improvements, efficiency gains, or scalability enhancements.
-                    - Include new use cases or efficiency gains expected from these advancements, and discuss how they reflect recent industry trends.
-                **Software Innovations**: 
-                - Outline cutting-edge software models and updates, including popular trends in AI applications:
-                    - Detail improvements in reasoning, multimodal capabilities, and efficiency with models like OpenAI’s GPT, Meta’s Llama, Google’s Gemini, and others that are driving new AI capabilities.
-                    - Emphasize recent developments in responsible AI, ethical AI practices, and any alignment improvements in popular models.
-                    - Include relevant benchmarks, unique features (such as increased context windows, enhanced image/video processing), and visual comparisons, highlighting recent improvements and trends.
-                **Open-Source Contributions**: 
-                - Showcase significant open-source AI releases, focusing on recent contributions and trends. Consider for example new open models and AI related frameworks. Consider LLMs and image generation models and other types when applicable.:
-                    - Highlight contributions from companies like Meta, Microsoft, Google, and others, explaining the anticipated impact and what is innovative about these tools.
-                    - Include real-world applications and potential impact, particularly in underrepresented regions or for solving specific societal challenges, showcasing the relevance to current global AI trends.
-                **Validation and Accuracy**: 
-                - Ensure all data points are accurate, verified, and from reputable sources. Avoid unverified claims by cross-referencing with multiple credible sources, primarily direct statements from the companies or technical documentation.
-            """
-            main_question_id = insert_question(conn, question_text)
+            # Define the main question
+            question_text = "what is the meaning of life"
+            logger.info(f"Main question: {question_text}")
+
+            # Insert the main question into the database
+            main_question_id = database.insert_question(conn, question_text)
+
+            # Process the main question
             main_answer = process_question(main_question_id, conn, cache)
+
             if main_answer:
                 print(f"Answer to the main question: {main_answer}")
+                logger.info("Successfully obtained an answer to the main question.")
             else:
                 print("Could not find an answer to the main question.")
+                logger.warning("Failed to obtain an answer to the main question.")
         except Exception as e:
             logger.exception("An error occurred during main execution.")
             print(f"An error occurred: {e}")
         finally:
             conn.close()
+            logger.debug("Database connection closed.")

@@ -1,5 +1,6 @@
 # tasks.py
-from typing import List, Dict, Any, Union, Callable
+
+from typing import List, Dict, Any, Callable
 import requests
 import os
 import json
@@ -37,7 +38,8 @@ from selenium.webdriver.support import expected_conditions as EC
 import random
 from lxml import html, etree
 
-# Configure logging
+# -------------------- Logging Configuration --------------------
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
@@ -48,7 +50,7 @@ os.makedirs(output_dir, exist_ok=True)
 # Create handlers if they don't already exist
 if not logger.handlers:
     # Configure the file handler to use the created directory
-    file_handler = logging.FileHandler(os.path.join(output_dir, 'tasks.log'))    
+    file_handler = logging.FileHandler(os.path.join(output_dir, 'tasks.log'))
     file_handler.setLevel(logging.DEBUG)
 
     console_handler = logging.StreamHandler()
@@ -63,38 +65,58 @@ if not logger.handlers:
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
 
-device = 'cpu' #LLM claims GPU
+# -------------------- Initialization of Models and Resources --------------------
+
+device = 'cpu'  # Adjust as necessary
 logger.debug("Loading SOM model.")
 som_model = get_yolo_model(model_path='weights/icon_detect/best.pt')
 som_model.to(device)
 logger.debug("Loading caption model processor.")
-caption_model_processor = get_caption_model_processor(model_name="florence2", model_name_or_path="weights/icon_caption_florence", device=device)
+caption_model_processor = get_caption_model_processor(
+    model_name="florence2",
+    model_name_or_path="weights/icon_caption_florence",
+    device=device
+)
+
+# Define the resources and their specific paths
+nltk_resources = {
+    "stopwords": "corpora/stopwords",
+    "punkt": "tokenizers/punkt",
+    "vader_lexicon": "sentiment/vader_lexicon"
+}
 
 # Download NLTK resources automatically if they are missing
-try:
-    nltk.data.find("corpora/stopwords")
-except LookupError:
-    nltk.download("stopwords", quiet=True)
-try:
-    nltk.data.find("tokenizers/punkt")
-except LookupError:
-    nltk.download("punkt", quiet=True)
-try:
-    nltk.data.find("vader_lexicon")
-except LookupError:
-    nltk.download("vader_lexicon", quiet=True)
+for resource_name, resource_path in nltk_resources.items():
+    try:
+        nltk.data.find(resource_path)
+        logger.debug(f"NLTK resource '{resource_name}' is already downloaded.")
+    except LookupError:
+        logger.debug(f"Downloading NLTK resource: '{resource_name}'")
+        nltk.download(resource_name, quiet=True)
+        # Verify download
+        try:
+            nltk.data.find(resource_path)
+            logger.debug(f"Successfully downloaded NLTK resource: '{resource_name}'")
+        except LookupError:
+            logger.error(f"Failed to download NLTK resource: '{resource_name}'")
 
 # Load spaCy model, downloading it if necessary
 try:
     nlp = spacy.load("en_core_web_sm")
 except OSError:
+    logger.debug("Downloading spaCy model: en_core_web_sm")
     subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"])
     nlp = spacy.load("en_core_web_sm")
+
+# -------------------- Constants --------------------
 
 OLLAMA_URL = "http://localhost:11434/api/generate"  # Replace with your actual endpoint
 SUMMARIZER_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Configurable summarizer model name
 IS_REPUTABLE_SOURCE_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Replace with your desired model name
 IS_CONTENT_VALUABLE_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Configurable model name for content validation
+EVALUATE_QUESTION_FOCUS_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Configurable model name for question focus evaluation
+
+# -------------------- Task Definitions --------------------
 
 # Define a dictionary to map task names to functions
 TASK_FUNCTIONS: Dict[str, Callable[[Dict[str, Any], Any], Dict[str, Any]]] = {}
@@ -182,11 +204,18 @@ def list_tasks() -> List[Dict[str, Any]]:
             "description": "Check if the extracted content is valuable for answering a question.",
             "parameters": ["extracted_text", "question"],
             "outcomes": ["is_valuable"]
+        },
+        {
+            "name": "evaluate_question_focus",
+            "description": "Evaluate whether a question is focused and detailed on a single topic.",
+            "parameters": ["question"],
+            "outcomes": ["is_focused"]
         }
     ]
 
-# Task function implementations
-def search_query(task_params, cache=None):
+# -------------------- Task Function Implementations --------------------
+
+def search_query(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     query = task_params.get('query')
     from_date = task_params.get('from_date', 'past month')
     logger.debug(f"Performing search query: {query}, from_date: {from_date}")
@@ -236,10 +265,10 @@ def search_query(task_params, cache=None):
     except Exception as e:
         logger.exception("An unexpected error occurred during search query.")
         return {"error": f"An unexpected error occurred: {str(e)}"}
-        
+
 TASK_FUNCTIONS["search_query"] = search_query
 
-def extract_content(task_params, cache=None):
+def extract_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     import hashlib
     url = task_params.get('url')
     question = task_params.get('question')
@@ -271,12 +300,12 @@ def extract_content(task_params, cache=None):
         logger.debug(f"Generated filename for image: {filename}")
 
         # Define the output directory
-        output_dir = os.path.join('output', 'images')
-        os.makedirs(output_dir, exist_ok=True)
-        logger.debug(f"Output directory: {output_dir}")
+        images_dir = os.path.join('output', 'images')
+        os.makedirs(images_dir, exist_ok=True)
+        logger.debug(f"Images directory: {images_dir}")
 
         # Define the full path to save the image
-        img_path = os.path.join(output_dir, filename)
+        img_path = os.path.join(images_dir, filename)
         logger.debug(f"Full image path: {img_path}")
 
         # Save the screenshot
@@ -378,14 +407,13 @@ def extract_content(task_params, cache=None):
 
         # Proceed to return the structured data
         return {'structured_data': extracted_text}
-
     except Exception as e:
-        logger.exception("An error occurred in extract_content.")
-        return {'error': f"An unexpected error occurred: {str(e)}"}
- 
+        logger.exception("An error occurred during content extraction.")
+        return {'error': f"An error occurred during content extraction: {str(e)}"}
+
 TASK_FUNCTIONS["extract_content"] = extract_content
 
-def is_content_valuable(task_params, cache=None):
+def is_content_valuable(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     extracted_text = task_params.get('extracted_text')
     question = task_params.get('question')
     if not extracted_text or not question:
@@ -411,7 +439,10 @@ def is_content_valuable(task_params, cache=None):
 
 TASK_FUNCTIONS["is_content_valuable"] = is_content_valuable
 
-def capture_screenshot(url):
+def capture_screenshot(url: str) -> (bytes, str):
+    """
+    Capture a screenshot of the given URL and return the image bytes and page source.
+    """
     logger.debug(f"Capturing screenshot for URL: {url}")
     # Set up Chrome options for headless browsing
     chrome_options = Options()
@@ -513,6 +544,9 @@ def capture_screenshot(url):
         logger.debug("WebDriver closed.")
 
 def simulate_human_mouse_movement(driver, element):
+    """
+    Simulate human-like mouse movement to interact with a web element.
+    """
     from selenium.webdriver.common.action_chains import ActionChains
     import numpy as np
 
@@ -553,9 +587,10 @@ def simulate_human_mouse_movement(driver, element):
         # If simulation fails, proceed without it
         pass
 
-def clean_html_content(html_content):
-    from lxml import html, etree
-
+def clean_html_content(html_content: bytes) -> str:
+    """
+    Clean the HTML content by removing unnecessary tags and elements.
+    """
     soup = BeautifulSoup(html_content, 'html.parser')
     for element in soup(['script', 'style', 'header', 'footer', 'nav', 'aside', 'form']):
         element.extract()
@@ -576,18 +611,23 @@ def clean_html_content(html_content):
         logger.error(f"Error in cleaning HTML: {e}")
         return ""
 
-def extract_text_from_html(cleaned_html):
+def extract_text_from_html(cleaned_html: str) -> str:
+    """
+    Extract text from cleaned HTML content.
+    """
     soup = BeautifulSoup(cleaned_html, 'html.parser')
     return soup.get_text(separator='\n')
 
-def cleanup_extracted_text(text):
-    import re
+def cleanup_extracted_text(text: str) -> str:
+    """
+    Cleanup the extracted text by removing excessive whitespace and formatting.
+    """
     text = re.sub(r'\n\s*\n', '\n\n', text)
     text = '\n'.join([line.strip() for line in text.split('\n')])
     text = re.sub(r'\s+', ' ', text)
     return text
 
-def validate_fact(task_params, cache=None):
+def validate_fact(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     statement = task_params.get('statement')
     logger.debug(f"Validating fact: {statement}")
     if not statement:
@@ -598,12 +638,13 @@ def validate_fact(task_params, cache=None):
     try:
         doc = nlp(statement)
         entities = [ent.text for ent in doc.ents if ent.label_ in ('ORG', 'GPE', 'PERSON', 'PRODUCT')]
+        logger.debug(f"Extracted entities: {entities}")
     except Exception as e:
         logger.exception("An error occurred while extracting entities from the statement.")
         entities = []
 
     # Step 2: Perform a search query to find relevant pages
-    search_results = search_query({'query': statement})
+    search_results = execute_task("search_query", {'query': statement}, cache)
     if 'error' in search_results:
         logger.error(f"Failed to retrieve search results: {search_results['error']}")
         return {"error": f"Failed to retrieve search results: {search_results['error']}"}
@@ -616,7 +657,7 @@ def validate_fact(task_params, cache=None):
         # Check if the URL is from a reputable source using execute_task
         reputable_result = execute_task("is_reputable_source", {"url": url}, cache)
         if reputable_result.get("is_reputable"):
-            content_result = extract_content({'url': url, 'question': statement}, cache)
+            content_result = execute_task("extract_content", {'url': url, 'question': statement}, cache)
 
             if 'structured_data' in content_result:
                 page_content = content_result['structured_data']
@@ -632,6 +673,8 @@ def validate_fact(task_params, cache=None):
     is_true = bool(verified_sources)
     confidence = min(1.0, 0.2 + len(verified_sources) * 0.2)  # Confidence increases with more sources
 
+    logger.debug(f"Fact validation result - is_true: {is_true}, confidence: {confidence}, sources: {verified_sources}")
+
     return {
         "is_true": is_true,
         "confidence": confidence,
@@ -640,7 +683,7 @@ def validate_fact(task_params, cache=None):
 
 TASK_FUNCTIONS["validate_fact"] = validate_fact
 
-def is_reputable_source(task_params, cache=None):
+def is_reputable_source(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     url = task_params.get('url')
     if not url:
         logger.error("No URL provided for reputation check.")
@@ -669,7 +712,7 @@ def is_reputable_source(task_params, cache=None):
 
 TASK_FUNCTIONS["is_reputable_source"] = is_reputable_source
 
-def summarize_text(task_params, cache=None):
+def summarize_text(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     text = task_params.get('text', '')
     question = task_params.get('question')
     logger.debug("Summarizing text.")
@@ -688,6 +731,7 @@ def summarize_text(task_params, cache=None):
 
     try:
         summary = send_llm_request(prompt, cache, SUMMARIZER_MODEL_NAME, OLLAMA_URL, expect_json=False)
+        logger.debug(f"Generated summary: {summary}")
         return {"summary": summary.strip()}
     except Exception as e:
         logger.exception("An error occurred while summarizing text.")
@@ -695,7 +739,7 @@ def summarize_text(task_params, cache=None):
 
 TASK_FUNCTIONS["summarize_text"] = summarize_text
 
-def analyze_sentiment(task_params, cache=None):
+def analyze_sentiment(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     text = task_params.get('text')
     logger.debug("Analyzing sentiment.")
     if not text:
@@ -713,13 +757,15 @@ def analyze_sentiment(task_params, cache=None):
         else:
             sentiment = 'neutral'
         confidence = abs(compound)
+        logger.debug(f"Sentiment analysis result: sentiment={sentiment}, confidence={confidence}")
         return {"sentiment": sentiment, "confidence": confidence}
     except Exception as e:
         logger.exception("An error occurred while analyzing sentiment.")
         return {"error": f"An error occurred while analyzing sentiment: {str(e)}"}
+
 TASK_FUNCTIONS["analyze_sentiment"] = analyze_sentiment
 
-def extract_entities(task_params, cache=None):
+def extract_entities(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     text = task_params.get('text')
     logger.debug("Extracting entities.")
     if not text:
@@ -730,13 +776,15 @@ def extract_entities(task_params, cache=None):
         entities = []
         for ent in doc.ents:
             entities.append({"type": ent.label_, "entity": ent.text})
+        logger.debug(f"Extracted entities: {entities}")
         return {"entities": entities}
     except Exception as e:
         logger.exception("An error occurred while extracting entities.")
         return {"error": f"An error occurred while extracting entities: {str(e)}"}
+
 TASK_FUNCTIONS["extract_entities"] = extract_entities
 
-def answer_question(task_params, cache=None):
+def answer_question(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     question = task_params.get('question')
     context = task_params.get('context')
     logger.debug(f"Answering question: {question}")
@@ -753,6 +801,7 @@ def answer_question(task_params, cache=None):
 
     try:
         answer = send_llm_request(prompt, cache, SUMMARIZER_MODEL_NAME, OLLAMA_URL, expect_json=False)
+        logger.debug(f"Generated answer: {answer}")
         return {"answer": answer}
     except Exception as e:
         logger.exception("An error occurred while answering question.")
@@ -760,7 +809,7 @@ def answer_question(task_params, cache=None):
 
 TASK_FUNCTIONS["answer_question"] = answer_question
 
-def extract_text_from_image(task_params, cache=None):
+def extract_text_from_image(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     image_path = task_params.get('image_path')
     logger.debug(f"Extracting text from image: {image_path}")
     if not image_path:
@@ -770,13 +819,15 @@ def extract_text_from_image(task_params, cache=None):
     try:
         image = Image.open(image_path)
         extracted_text = pytesseract.image_to_string(image)
+        logger.debug(f"Extracted text from image: {extracted_text}")
         return {"extracted_text": extracted_text}
     except Exception as e:
         logger.exception("An error occurred while extracting text from image.")
         return {"error": f"An error occurred while extracting text from image: {str(e)}"}
+
 TASK_FUNCTIONS["extract_text_from_image"] = extract_text_from_image
 
-def translate_text(task_params, cache=None):
+def translate_text(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     text = task_params.get('text')
     language = task_params.get('language')
     logger.debug(f"Translating text to {language}.")
@@ -791,6 +842,7 @@ def translate_text(task_params, cache=None):
     try:
         translator = Translator(to_lang=language)
         translated_text = translator.translate(text)
+        logger.debug(f"Translated text: {translated_text}")
         return {"translated_text": translated_text}
     except Exception as e:
         logger.exception("An error occurred during translation.")
@@ -798,7 +850,7 @@ def translate_text(task_params, cache=None):
 
 TASK_FUNCTIONS["translate_text"] = translate_text
 
-def parse_json(task_params, cache=None):
+def parse_json(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     file_path = task_params.get('file_path')
     logger.debug(f"Parsing JSON file: {file_path}")
     if not file_path:
@@ -807,29 +859,93 @@ def parse_json(task_params, cache=None):
     try:
         with open(file_path, 'r') as f:
             data = json.load(f)
+        logger.debug(f"Parsed JSON data: {data}")
         return {"parsed_data": data}
     except Exception as e:
         logger.exception("An error occurred while parsing JSON.")
         return {"error": f"An error occurred while parsing JSON: {str(e)}"}
+
 TASK_FUNCTIONS["parse_json"] = parse_json
 
-def extract_keywords(task_params, cache=None):
+def extract_keywords(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     text = task_params.get('text')
-    logger.debug("Extracting keywords.")
+    logger.debug("Starting keyword extraction process.")
+    
     if not text:
         logger.error("No text provided for keyword extraction.")
         return {"error": "No text provided for keyword extraction."}
+
+    # Step 1: Ensure required NLTK resources are available
+    required_resources = ['punkt', 'stopwords']
+    for resource in required_resources:
+        try:
+            resource_path = f'tokenizers/{resource}' if resource == 'punkt' else f'corpora/{resource}'
+            nltk.data.find(resource_path)
+            logger.debug(f"NLTK resource '{resource}' is already available.")
+        except LookupError:
+            logger.debug(f"Downloading missing NLTK resource: '{resource}'")
+            try:
+                nltk.download(resource, quiet=True)
+                nltk.data.find(resource_path)
+                logger.debug(f"Successfully downloaded NLTK resource: '{resource}'")
+            except LookupError:
+                logger.error(f"Failed to download NLTK resource: '{resource}'")
+                return {"error": f"Required NLTK resource '{resource}' is missing and could not be downloaded."}
+
+    # Step 2: Initialize Rake and extract keywords
     try:
-        rake_nltk_var = Rake()
+        rake_nltk_var = Rake(language='english')
+        logger.debug("Rake initialized successfully with language='english'. Extracting keywords from text.")
+        
+        # Extract keywords
         rake_nltk_var.extract_keywords_from_text(text)
         keywords = rake_nltk_var.get_ranked_phrases()
+        logger.debug(f"Extracted keywords: {keywords}")
+
         return {"keywords": keywords}
+    except LookupError as e:
+        # Handle specific NLTK lookup errors
+        logger.exception("A LookupError occurred during keyword extraction.")
+        return {"error": f"A LookupError occurred during keyword extraction: {str(e)}"}
     except Exception as e:
-        logger.exception("An error occurred while extracting keywords.")
-        return {"error": f"An error occurred while extracting keywords: {str(e)}"}
+        # Log any other exceptions
+        logger.exception("An unexpected error occurred during keyword extraction.")
+        return {"error": f"An unexpected error occurred during keyword extraction: {str(e)}"}
+    
 TASK_FUNCTIONS["extract_keywords"] = extract_keywords
 
-def execute_task(task_name, parameters, cache=None):
+def evaluate_question_focus(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
+    question = task_params.get('question')
+    logger.debug(f"Evaluating focus of question: {question}")
+    if not question:
+        logger.error("No question provided for focus evaluation.")
+        return {"error": "No question provided for focus evaluation."}
+
+    prompt = (
+        "Determine whether the following question is focused and detailed enough to be considered a single-topic question. "
+        "A focused question should be specific, clear, and centered around one main topic without multiple unrelated subtopics. "
+        "Provide a simple 'Yes' or 'No' answer.\n\n"
+        f"Question:\n{question}\n\nIs this question focused and detailed on a single topic? Answer 'Yes' or 'No'."
+    )
+
+    try:
+        response = send_llm_request(prompt, cache, EVALUATE_QUESTION_FOCUS_MODEL_NAME, OLLAMA_URL, expect_json=False)
+        answer = response.strip().lower()
+        logger.debug(f"LLM response for evaluate_question_focus: {answer}")
+        is_focused = 'yes' in answer
+        return {"is_focused": is_focused}
+    except Exception as e:
+        logger.exception("An error occurred during question focus evaluation.")
+        return {"error": f"An error occurred during question focus evaluation: {str(e)}"}
+
+TASK_FUNCTIONS["evaluate_question_focus"] = evaluate_question_focus
+
+# -------------------- Execute Task Function --------------------
+
+def execute_task(task_name: str, parameters: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
+    """
+    Execute a task by its name with the given parameters.
+    """
     task_function = TASK_FUNCTIONS.get(task_name)
 
     # Log task_name and parameters to debug
@@ -839,7 +955,11 @@ def execute_task(task_name, parameters, cache=None):
         raise TypeError(f"Expected parameters to be a dictionary, got {type(parameters)}")
 
     if task_function:
-        return task_function(parameters, cache)
+        try:
+            return task_function(parameters, cache)
+        except Exception as e:
+            logger.exception(f"Error executing task '{task_name}': {e}")
+            return {"error": str(e)}
     else:
         logger.error(f"No function found for task: {task_name}")
         raise ValueError(f"No function found for task: {task_name}")
