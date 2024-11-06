@@ -1154,7 +1154,7 @@ def evaluate_question_focus(task_params: Dict[str, Any], cache: Any = None) -> D
         return {"error": "No question provided for focus evaluation."}
 
     prompt = (
-        "Determine whether the following question is focused and detailed enough to be considered a single-topic question. "
+        "Determine whether the following question is focused and detailed enough to be considered a single-topic question with an answer that can be a couple of concise sentences. An example of a focused question is: What are recent NVIDIA AI products. An example of a question which is not focused is: write a detailed report on recent advancements in the area of AI.\n\n"
         "A focused question should be specific, clear, and centered around one main topic without multiple unrelated subtopics. It should not be abstract but concrete and answerable.\n\n"
         "Provide a simple 'Yes' or 'No' answer.\n\n"
         f"Question:\n{question}\n\nIs this question focused and detailed on a single topic? Answer 'Yes' or 'No'."
