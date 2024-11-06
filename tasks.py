@@ -36,6 +36,7 @@ from selenium.webdriver.support import expected_conditions as EC
 import random
 from lxml import html, etree
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
+from typing import List, Dict, Any, Callable, Optional, Tuple
 
 # -------------------- Logging Configuration --------------------
 
@@ -114,6 +115,7 @@ SUMMARIZER_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Configurable summarizer m
 IS_REPUTABLE_SOURCE_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Replace with your desired model name
 IS_CONTENT_VALUABLE_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for content validation
 EVALUATE_QUESTION_FOCUS_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Configurable model name for question focus evaluation
+EVALUATE_SUMMARY_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Configurable model name for summary evaluation
 
 # -------------------- Task Definitions --------------------
 
@@ -209,6 +211,12 @@ def list_tasks() -> List[Dict[str, Any]]:
             "description": "Evaluate whether a question is focused and detailed on a single topic.",
             "parameters": ["question"],
             "outcomes": ["is_focused"]
+        },
+        {
+            "name": "evaluate_summary",
+            "description": "Evaluate whether a summary is valuable for inclusion in the final answer.",
+            "parameters": ["summary", "question"],
+            "outcomes": ["is_valuable"]
         }
     ]
 
@@ -313,7 +321,19 @@ def fetch_youtube_transcript(url: str) -> Dict[str, Any]:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
 def extract_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
+    """
+    Extract relevant content from a webpage.
+
+    Args:
+        task_params (Dict[str, Any]): Parameters containing 'url' and 'question'.
+        cache (Any): Optional cache parameter.
+
+    Returns:
+        Dict[str, Any]: Extracted content or error information.
+    """
     import hashlib
+    from typing import Optional, Tuple
+
     url = task_params.get('url')
     question = task_params.get('question')
     logger.debug(f"Starting extract_content with URL: {url}")
@@ -330,6 +350,7 @@ def extract_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
     if 'youtube.com' in parsed_url.netloc or 'youtu.be' in parsed_url.netloc:
         is_youtube = True
 
+    extracted_text = ""
     try:
         if is_youtube:
             logger.debug("Detected YouTube URL. Attempting to fetch transcript.")
@@ -342,138 +363,213 @@ def extract_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
                 return {'error': f"Failed to fetch transcript: {transcript_result.get('error')}"}
         else:
             # Initialize variables
-            page_source = None
-            response = None
+            screenshot: Optional[bytes] = None
+            page_source: Optional[str] = None
 
             # Capture a screenshot and get page source of the webpage
             try:
                 screenshot, page_source = capture_screenshot(url)
-                logger.debug("Captured screenshot and page source of the webpage.")
-
-                # Generate a unique filename using a hash of the URL
-                domain = parsed_url.netloc
-
-                # Create a hash of the URL to use as filename
-                url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
-
-                filename = f"{domain}_{url_hash}.png"
-                logger.debug(f"Generated filename for image: {filename}")
-
-                # Define the output directory
-                images_dir = os.path.join('output', 'images')
-                os.makedirs(images_dir, exist_ok=True)
-                logger.debug(f"Images directory: {images_dir}")
-
-                # Define the full path to save the image
-                img_path = os.path.join(images_dir, filename)
-                logger.debug(f"Full image path: {img_path}")
-
-                # Save the screenshot
-                with open(img_path, 'wb') as f:
-                    f.write(screenshot)
-                logger.debug("Screenshot saved.")
-
-                draw_bbox_config = {
-                    'text_scale': 0.8,
-                    'text_thickness': 2,
-                    'text_padding': 3,
-                    'thickness': 3,
-                }
-                BOX_THRESHOLD = 0.03
-
-                logger.debug("Starting OCR processing.")
-                try:
-                    ocr_bbox_rslt, is_goal_filtered = check_ocr_box(
-                        image_path=img_path,
-                        display_img=False,
-                        output_bb_format='xyxy',
-                        goal_filtering=None,
-                        easyocr_args={'paragraph': False, 'text_threshold': 0.9},
-                        use_paddleocr=True
-                    )
-                    if ocr_bbox_rslt is None:
-                        logger.error("OCR bbox result is None.")
-                        raise ValueError("OCR bbox result is None.")
-                    text, ocr_bbox = ocr_bbox_rslt
-                    logger.debug(f"OCR text length: {len(text)}, number of OCR boxes: {len(ocr_bbox)}")
-
-                    logger.debug("Starting SOM label extraction.")
-                    som_result = get_som_labeled_img(
-                        img_path=img_path,
-                        model=som_model,
-                        BOX_TRESHOLD=BOX_THRESHOLD,
-                        output_coord_in_ratio=False,
-                        ocr_bbox=ocr_bbox,  # Pass the actual OCR bounding boxes
-                        draw_bbox_config=draw_bbox_config,
-                        caption_model_processor=caption_model_processor,
-                        ocr_text=text,  # Pass the extracted text
-                        use_local_semantics=True,
-                        iou_threshold=0.1
-                    )
-                    if som_result is None:
-                        logger.error("SOM labeled image result is None.")
-                        raise ValueError("SOM labeled image result is None.")
-                    dino_labeled_img, label_coordinates, parsed_content_list = som_result
-                    logger.debug(f"Parsed content list length: {len(parsed_content_list)}")
-
-                    # Assign extracted text for validation
-                    extracted_text = parsed_content_list
-
-                except Exception as e:
-                    logger.exception("An error occurred during OCR processing. Falling back to processing page source or response content.")
-
-                    # Try to use page_source from Selenium
-                    if page_source:
-                        logger.debug("Using page source from Selenium to extract content.")
-                        content_to_process = page_source
-                    else:
-                        logger.debug("Fetching URL content via requests.")
-                        headers = {'User-Agent': 'Mozilla/5.0'}
-                        try:
-                            response = requests.get(url, headers=headers)
-                            response.raise_for_status()
-                            logger.debug(f"Successfully fetched URL via requests: {url}")
-                            content_to_process = response.content
-                        except requests.RequestException as e:
-                            logger.exception(f"Failed to fetch URL via requests: {url}")
-                            content_to_process = None
-
-                    if content_to_process:
-                        # Clean the content
-                        cleaned_html = clean_html_content(content_to_process)
-                        logger.debug("Cleaned HTML content.")
-
-                        # Extract text from the cleaned html
-                        text_content = extract_text_from_html(cleaned_html)
-                        logger.debug("Extracted text from cleaned HTML.")
-
-                        # Cleanup the extracted text
-                        text_content = cleanup_extracted_text(text_content)
-                        logger.debug("Cleaned up extracted text.")
-
-                        # Assign extracted text for validation
-                        extracted_text = text_content
-                    else:
-                        logger.error("No content available to extract.")
-                        return {'error': "No content available to extract."}
-
+                if screenshot and page_source:
+                    logger.debug("Captured screenshot and page source of the webpage.")
+                else:
+                    logger.warning("Failed to capture screenshot and/or page source.")
             except Exception as e:
-                logger.exception("An error occurred during content extraction.")
-                return {'error': f"An error occurred during content extraction: {str(e)}"}
+                logger.exception(f"Error during capture_screenshot: {e}")
+                # Proceed to fallback methods
 
-        # Validate the extracted content using LLM via execute_task
-        is_valuable_result = execute_task("is_content_valuable", {"extracted_text": extracted_text, "question": question}, cache)
-        if "error" in is_valuable_result:
-            logger.error(f"Content validation failed: {is_valuable_result['error']}")
-            return {'error': f"Content validation failed: {is_valuable_result['error']}"}
+            try:
+                if screenshot and page_source:
+                    # Process the screenshot via OCR
+                    
+                        # Generate a unique filename using a hash of the URL
+                        domain = parsed_url.netloc
+                        url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
+                        filename = f"{domain}_{url_hash}.png"
+                        logger.debug(f"Generated filename for image: {filename}")
 
-        is_valuable = is_valuable_result.get("is_valuable", False)
-        if not is_valuable:
-            logger.debug("Extracted content is not valuable for answering the question.")
-            return {'is_valuable': False, "structured_data": extracted_text}
+                        # Define the output directory
+                        images_dir = os.path.join(output_dir, 'images')  # Use the existing output_dir
+                        os.makedirs(images_dir, exist_ok=True)
+                        logger.debug(f"Images directory: {images_dir}")
+
+                        # Define the full path to save the image
+                        img_path = os.path.join(images_dir, filename)
+                        logger.debug(f"Full image path: {img_path}")
+
+                        # Save the screenshot
+                        try:
+                            with open(img_path, 'wb') as f:
+                                f.write(screenshot)
+                            logger.debug("Screenshot saved.")
+                        except Exception as e:
+                            logger.exception(f"Failed to save screenshot: {e}")
+                            # Proceed without saving the image
+
+                        # Perform OCR and other processing
+                        draw_bbox_config = {
+                            'text_scale': 0.8,
+                            'text_thickness': 2,
+                            'text_padding': 3,
+                            'thickness': 3,
+                        }
+                        BOX_THRESHOLD = 0.03
+
+                        logger.debug("Starting OCR processing.")
+                        try:
+                            ocr_bbox_rslt, is_goal_filtered = check_ocr_box(
+                                image_path=img_path,
+                                display_img=False,
+                                output_bb_format='xyxy',
+                                goal_filtering=None,
+                                easyocr_args={'paragraph': False, 'text_threshold': 0.9},
+                                use_paddleocr=True
+                            )
+                            if ocr_bbox_rslt is None:
+                                logger.error("OCR bbox result is None.")
+                                raise ValueError("OCR bbox result is None.")
+                            text, ocr_bbox = ocr_bbox_rslt
+                            logger.debug(f"OCR text length: {len(text)}, number of OCR boxes: {len(ocr_bbox)}")
+
+                            logger.debug("Starting SOM label extraction.")
+                            som_result = get_som_labeled_img(
+                                img_path=img_path,
+                                model=som_model,
+                                BOX_TRESHOLD=BOX_THRESHOLD,
+                                output_coord_in_ratio=False,
+                                ocr_bbox=ocr_bbox,  # Pass the actual OCR bounding boxes
+                                draw_bbox_config=draw_bbox_config,
+                                caption_model_processor=caption_model_processor,
+                                ocr_text=text,  # Pass the extracted text
+                                use_local_semantics=True,
+                                iou_threshold=0.1
+                            )
+                            if som_result is None:
+                                logger.error("SOM labeled image result is None.")
+                                raise ValueError("SOM labeled image result is None.")
+                            dino_labeled_img, label_coordinates, parsed_content_list = som_result
+                            logger.debug(f"Parsed content list length: {len(parsed_content_list)}")
+
+                            # Assign extracted text for validation
+                            extracted_text = parsed_content_list
+
+                        except Exception as e:
+                            logger.exception("An error occurred during OCR processing. Falling back to processing page source or response content.")
+                            # Proceed to fallback extraction
+
+                            # Try to use page_source from Selenium
+                            if page_source:
+                                logger.debug("Using page source from Selenium to extract content.")
+                                content_to_process = page_source
+                            else:
+                                logger.debug("Fetching URL content via requests.")
+                                headers = {'User-Agent': 'Mozilla/5.0'}
+                                try:
+                                    response = requests.get(url, headers=headers, timeout=10)
+                                    response.raise_for_status()
+                                    logger.debug(f"Successfully fetched URL via requests: {url}")
+                                    content_to_process = response.content
+                                except requests.RequestException as e:
+                                    logger.exception(f"Failed to fetch URL via requests: {url}")
+                                    content_to_process = None
+
+                            if content_to_process:
+                                # Clean the content
+                                try:
+                                    cleaned_html = clean_html_content(content_to_process)
+                                    logger.debug("Cleaned HTML content.")
+                                except Exception as e:
+                                    logger.exception(f"Failed to clean HTML content: {e}")
+                                    cleaned_html = ""
+
+                                # Extract text from the cleaned html
+                                try:
+                                    text_content = extract_text_from_html(cleaned_html)
+                                    logger.debug("Extracted text from cleaned HTML.")
+                                except Exception as e:
+                                    logger.exception(f"Failed to extract text from HTML: {e}")
+                                    text_content = ""
+
+                                # Cleanup the extracted text
+                                try:
+                                    text_content = cleanup_extracted_text(text_content)
+                                    logger.debug("Cleaned up extracted text.")
+                                except Exception as e:
+                                    logger.exception(f"Failed to clean up extracted text: {e}")
+                                    text_content = ""
+
+                                # Assign extracted text for validation
+                                extracted_text = text_content
+                            else:
+                                logger.error("No content available to extract.")
+                                return {'error': "No content available to extract."}
+                else:
+                    raise Exception("No screenshot or page source available.")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to capture screenshot and/or page source. Falling back to requests.get: {e}")
+                # Attempt to fetch via requests.get
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                try:
+                    response = requests.get(url, headers=headers, timeout=10)
+                    response.raise_for_status()
+                    logger.debug(f"Successfully fetched URL via requests: {url}")
+                    content_to_process = response.content
+                except requests.RequestException as e:
+                    logger.exception(f"Failed to fetch URL via requests: {url}")
+                    return {'error': f"Failed to fetch URL via requests: {e}"}
+
+                # Clean the content
+                try:
+                    cleaned_html = clean_html_content(content_to_process)
+                    logger.debug("Cleaned HTML content.")
+                except Exception as e:
+                    logger.exception(f"Failed to clean HTML content: {e}")
+                    cleaned_html = ""
+
+                # Extract text from the cleaned html
+                try:
+                    text_content = extract_text_from_html(cleaned_html)
+                    logger.debug("Extracted text from cleaned HTML.")
+                except Exception as e:
+                    logger.exception(f"Failed to extract text from HTML: {e}")
+                    text_content = ""
+
+                # Cleanup the extracted text
+                try:
+                    text_content = cleanup_extracted_text(text_content)
+                    logger.debug("Cleaned up extracted text.")
+                except Exception as e:
+                    logger.exception(f"Failed to clean up extracted text: {e}")
+                    text_content = ""
+
+                # Assign extracted text for validation
+                extracted_text = text_content
+
+        # Now, proceed to validate the extracted content
+        if extracted_text:
+            # Validate the extracted content using LLM via execute_task
+            try:
+                is_valuable_result = execute_task("is_content_valuable", {"extracted_text": extracted_text, "question": question}, cache)
+            except Exception as e:
+                logger.exception(f"Failed to execute 'is_content_valuable' task: {e}")
+                is_valuable_result = {"error": f"Failed to execute 'is_content_valuable' task: {e}"}
+
+            if "error" in is_valuable_result:
+                logger.error(f"Content validation failed: {is_valuable_result['error']}")
+                # Proceed with the extracted content even if validation fails
+                return {'is_valuable': False, "structured_data": extracted_text, "validation_error": is_valuable_result['error']}
+
+            is_valuable = is_valuable_result.get("is_valuable", False)
+            if not is_valuable:
+                logger.debug("Extracted content is not valuable for answering the question.")
+                return {'is_valuable': False, "structured_data": extracted_text}
+            else:
+                logger.debug("Extracted content is valuable.")
+                return {'is_valuable': True, "structured_data": extracted_text}
         else:
-            logger.debug("Extracted content is valuable.")
-            return {'is_valuable': True, "structured_data": extracted_text}
+            logger.error("No extracted text available after content extraction.")
+            return {'error': "No extracted text available after content extraction."}
+
     except Exception as e:
         logger.exception("An error occurred during content extraction.")
         return {'error': f"An error occurred during content extraction: {str(e)}"}
@@ -517,18 +613,39 @@ def is_content_valuable(task_params: Dict[str, Any], cache: Any = None) -> Dict[
 
 TASK_FUNCTIONS["is_content_valuable"] = is_content_valuable
 
-def capture_screenshot(url: str) -> (bytes, str):
+def capture_screenshot(url: str, max_retries: int = 3, delay: int = 5) -> Optional[Tuple[bytes, str]]:
     """
     Capture a screenshot of the given URL and return the image bytes and page source.
+    If it fails after retries, returns (None, None).
+
+    Args:
+        url (str): The URL to capture.
+        max_retries (int): Number of retries for loading the URL.
+        delay (int): Delay in seconds between retries.
+
+    Returns:
+        Tuple[bytes, str]: Screenshot bytes and page source, or (None, None) if failed.
     """
     logger.debug(f"Capturing screenshot for URL: {url}")
+
+    # Validate URL
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        logger.debug(f"URL scheme missing, adding 'https://': {url}")
+        url = 'https://' + url
+
     # Set up Chrome options for headless browsing
     chrome_options = Options()
-    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--headless=new")  # Use the new headless mode
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--disable-infobars")
+    chrome_options.add_argument("--start-maximized")
+    chrome_options.add_argument("--disable-popup-blocking")
+    chrome_options.add_argument("--ignore-certificate-errors")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
 
     # Initialize the undetected Chrome WebDriver with use_subprocess=True
     try:
@@ -536,60 +653,61 @@ def capture_screenshot(url: str) -> (bytes, str):
         driver = uc.Chrome(options=chrome_options, use_subprocess=True)
     except Exception as e:
         logger.exception("Failed to initialize undetected_chromedriver with subprocess.")
-        raise
+        return None, None
 
     try:
-        # Navigate to the specified URL
-        driver.get(url)
-        logger.debug("Navigated to URL.")
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.debug(f"Attempt {attempt} to navigate to URL: {url}")
+                driver.get(url)
+                logger.debug("Navigated to URL.")
 
-        # Wait for the page to load completely
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-        logger.debug("Page loaded successfully.")
-        
+                # Wait for the page to load completely
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+                )
+                logger.debug("Page loaded successfully.")
+                break  # Success, exit loop
+            except selenium.common.exceptions.WebDriverException as e:
+                logger.warning(f"Attempt {attempt} failed with WebDriverException: {e}")
+                if attempt < max_retries:
+                    logger.debug(f"Retrying after {delay} seconds...")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"All {max_retries} attempts to load the URL failed.")
+                    return None, None
+            except Exception as e:
+                logger.exception(f"An unexpected error occurred during driver.get: {e}")
+                return None, None
+
         # Attempt to click away cookie banners
         try:
-            # Find cookie buttons with refined criteria for "accept" and similar terms
-            cookie_buttons = WebDriverWait(driver, 5).until(
-                EC.presence_of_all_elements_located((
-                    By.XPATH,
-                    "//*[(@role='button' or @type='button' or @class) and "
-                    "(contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept') or "
-                    "contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'agree') or "
-                    "contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'proceed') or "
-                    "contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'allow') or "
-                    "contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'consent') or "
-                    "contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'ok') or "
-                    "contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue') or "
-                    "contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'save changes'))]"
-                ))
-            )
+            logger.debug("Attempting to click away cookie banners.")
+            # Define possible XPaths for cookie buttons
+            cookie_button_xpaths = [
+                "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept')]",
+                "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'agree')]",
+                "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'proceed')]",
+                "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'allow')]",
+                "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'consent')]",
+                "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'ok')]",
+                "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')]",
+                "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'save changes')]",
+            ]
 
-            # Attempt to click only the first visible and clickable button
-            for cookie_button in cookie_buttons:
+            for xpath in cookie_button_xpaths:
                 try:
-                    # Check if the button is visible and clickable
-                    if WebDriverWait(driver, 5).until(EC.visibility_of(cookie_button)) and \
-                       WebDriverWait(driver, 5).until(EC.element_to_be_clickable(cookie_button)):
-                        logger.debug("Found clickable, visible cookie pop-up button, attempting natural mouse movement click")
-                        # Attempt to click using natural mouse movement
-                        simulate_human_mouse_movement(driver, cookie_button)
-                        try:
-                            # Wait for the cookie banner to disappear
-                            WebDriverWait(driver, 5).until(EC.invisibility_of_element(cookie_button))
-                            logger.debug("Cookie pop-up disappeared successfully via natural mouse movement click")
-                            break  # Exit after successfully handling one cookie banner
-                        except Exception as e:
-                            logger.debug(f"Natural mouse movement click failed: {e}, attempting programmatic click")
-                            # If natural click fails, attempt programmatic click
-                            cookie_button.click()
-                            WebDriverWait(driver, 5).until(EC.invisibility_of_element(cookie_button))
-                            logger.debug("Cookie pop-up disappeared successfully via programmatic click")
-                            break  # Exit after successfully handling one cookie banner
+                    buttons = driver.find_elements(By.XPATH, xpath)
+                    for button in buttons:
+                        if button.is_displayed() and button.is_enabled():
+                            logger.debug(f"Found cookie button with XPath: {xpath}, attempting to click.")
+                            simulate_human_mouse_movement(driver, button)
+                            WebDriverWait(driver, 5).until(EC.invisibility_of_element(button))
+                            logger.debug("Cookie banner handled successfully.")
+                            break  # Exit after clicking one button
                 except Exception as e:
-                    logger.debug(f"Could not click the button or button did not disappear: {e}")
+                    logger.debug(f"Could not click cookie button with XPath: {xpath}. Error: {e}")
+            logger.debug("Finished attempting to click cookie banners.")
         except Exception as e:
             logger.debug(f"No cookie pop-up found or could not locate buttons: {e}")
 
@@ -597,13 +715,22 @@ def capture_screenshot(url: str) -> (bytes, str):
         time.sleep(2)
 
         # Get the page source
-        page_source = driver.page_source
+        try:
+            page_source = driver.page_source
+            logger.debug("Page source obtained successfully.")
+        except Exception as e:
+            logger.exception(f"Failed to get page source: {e}")
+            page_source = None
 
-        # Now proceed to capture the screenshot as before
+        # Now proceed to capture the screenshot
 
         # Calculate the total height of the page
-        total_height = driver.execute_script("return document.body.scrollHeight")
-        logger.debug(f"Total page height: {total_height}")
+        try:
+            total_height = driver.execute_script("return document.body.scrollHeight")
+            logger.debug(f"Total page height: {total_height}")
+        except Exception as e:
+            logger.warning(f"Failed to get page height: {e}. Using default height 1080.")
+            total_height = 1080
 
         # Set a maximum height to avoid OpenCV errors
         MAX_HEIGHT = 32766  # SHRT_MAX - 1
@@ -613,20 +740,33 @@ def capture_screenshot(url: str) -> (bytes, str):
             total_height = MAX_HEIGHT
 
         # Set the window size to the total height of the page or the maximum height
-        driver.set_window_size(1920, total_height)
-        logger.debug("Window size set for full page height.")
+        try:
+            driver.set_window_size(1920, total_height)
+            logger.debug("Window size set for full page height.")
+        except Exception as e:
+            logger.warning(f"Failed to set window size to full page height: {e}. Using default size.")
+            try:
+                driver.set_window_size(1920, 1080)
+                logger.debug("Window size set to default 1920x1080.")
+            except Exception as ex:
+                logger.exception(f"Failed to set default window size: {ex}")
+                # Proceed without setting window size
 
         # Allow time for the window size adjustment
         time.sleep(3)  # Adjust sleep time as necessary
 
         # Capture the screenshot
-        screenshot = driver.get_screenshot_as_png()
-        logger.debug("Screenshot captured.")
+        try:
+            screenshot = driver.get_screenshot_as_png()
+            logger.debug("Screenshot captured.")
+        except Exception as e:
+            logger.exception(f"Failed to capture screenshot: {e}")
+            screenshot = None
 
         return screenshot, page_source
     except Exception as e:
-        logger.exception("An error occurred while capturing screenshot.")
-        raise
+        logger.exception(f"An error occurred while capturing screenshot: {e}")
+        return None, None
     finally:
         # Close the WebDriver
         try:
@@ -1031,6 +1171,54 @@ def evaluate_question_focus(task_params: Dict[str, Any], cache: Any = None) -> D
         return {"error": f"An error occurred during question focus evaluation: {str(e)}"}
 
 TASK_FUNCTIONS["evaluate_question_focus"] = evaluate_question_focus
+
+def evaluate_summary(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
+    """
+    Evaluate whether a summary is valuable for inclusion in the final answer.
+
+    Args:
+        task_params (Dict[str, Any]): Parameters containing 'summary' and 'question'.
+        cache (Any): Optional cache parameter.
+
+    Returns:
+        Dict[str, Any]: Evaluation result indicating if the summary is valuable.
+    """
+    summary = task_params.get('summary')
+    question = task_params.get('question')
+    logger.debug(f"Evaluating summary: {summary} for question: {question}")
+    if not summary or not question:
+        logger.error("Both 'summary' and 'question' must be provided for summary evaluation.")
+        return {"error": "Both 'summary' and 'question' must be provided for summary evaluation."}
+
+    prompt = (
+        "Determine whether the following summary is valuable for inclusion in the final answer to the given question. "
+        "A valuable summary should be relevant, concise, and provide clear insights that directly address the question. "
+        "Avoid summaries that are off-topic, too vague, or redundant.\n\n"
+        f"Question:\n{question}\n\nSummary:\n{summary}\n\n"
+        "Is this summary valuable for the final answer? Answer with only 'Yes' or 'No'."
+    )
+
+    try:
+        response = send_llm_request(prompt, cache, EVALUATE_SUMMARY_MODEL_NAME, OLLAMA_URL, expect_json=False)
+        answer = response.strip().lower()
+        logger.debug(f"LLM evaluation response for summary: '{answer}'")
+        # Extract the first word to determine the answer
+        first_word = answer.split()[0] if answer else ''
+        if first_word == 'yes':
+            is_valuable = True
+        elif first_word == 'no':
+            is_valuable = False
+        else:
+            logger.warning(f"Unexpected LLM response format: '{response}'. Defaulting to 'Not Valuable'.")
+            is_valuable = False  # Default to not valuable if response is unexpected
+
+        logger.debug(f"Parsed 'is_valuable' from summary evaluation: {is_valuable}")
+        return {"is_valuable": is_valuable}
+    except Exception as e:
+        logger.exception("An error occurred during summary evaluation.")
+        return {"error": f"An error occurred during summary evaluation: {str(e)}"}
+
+TASK_FUNCTIONS["evaluate_summary"] = evaluate_summary
 
 # -------------------- Execute Task Function --------------------
 

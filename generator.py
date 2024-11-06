@@ -114,9 +114,42 @@ def generate_answer_from_context(context: Dict[str, Any], cache: Any) -> str:
         }
     }
     prompt_str = json.dumps(prompt)
-    response = send_llm_request(prompt_str, cache, ANSWER_GENERATION_MODEL_NAME, OLLAMA_URL, expect_json=True)
-    answer = response.get('answer', "")
-    return answer
+
+    # Enhanced Logging: Capture the raw response
+    try:
+        response = send_llm_request(prompt_str, cache, ANSWER_GENERATION_MODEL_NAME, OLLAMA_URL, expect_json=False)
+        logger.debug(f"Raw LLM response: {response}")
+
+        # Attempt to extract JSON from the response
+        # Remove any code blocks or extra text that might interfere with JSON parsing
+        # For example, remove ```json\n and \n``` if present
+        json_start = response.find('{')
+        json_end = response.rfind('}') + 1
+        if json_start == -1 or json_end == -1:
+            logger.error("No JSON object found in the LLM response.")
+            return ""
+
+        json_str = response[json_start:json_end]
+        logger.debug(f"Extracted JSON string: {json_str}")
+
+        # Parse the JSON string
+        parsed_response = json.loads(json_str)
+
+        # Extract the 'answer' field
+        answer = parsed_response.get("answer", "")
+        if not isinstance(answer, str):
+            logger.error("The 'answer' field is missing or not a string in the JSON response.")
+            return ""
+        logger.debug(f"Generated answer: {answer}")
+        return answer
+
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decoding failed: {e}")
+        logger.error(f"LLM response was: {response}")
+        return ""
+    except Exception as e:
+        logger.exception(f"An unexpected error occurred while generating answer from context: {e}")
+        return ""
 
 def generate_initial_tasks(question_text: str, keywords: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """
@@ -272,11 +305,33 @@ def process_task(task: Dict[str, Any], question_id: int, question_text: str, con
                             'error': summary_outcome['outcome']['error']
                         })
                         continue
-                    # Collect summaries
-                    sub_task_outcomes.append({
-                        'url': url,
-                        'summary': summary_outcome.get('outcome', {}).get('summary')
-                    })
+                    summary = summary_outcome.get('outcome', {}).get('summary')
+                    # Evaluate the summary for value
+                    evaluation_task = {
+                        'name': 'evaluate_summary',
+                        'parameters': {'summary': summary, 'question': question_text}
+                    }
+                    evaluation_outcome = process_task(evaluation_task, question_id, question_text, conn, cache)
+                    if 'error' in evaluation_outcome.get('outcome', {}):
+                        logger.error(f"Error in sub-task 'evaluate_summary': {evaluation_outcome['outcome']['error']}")
+                        # When in doubt, consider the information valuable
+                        is_valuable = True
+                    else:
+                        is_valuable = evaluation_outcome.get('outcome', {}).get('is_valuable', True)
+                        if is_valuable is None:
+                            is_valuable = True  # Default to valuable if unsure
+                    if is_valuable:
+                        sub_task_outcomes.append({
+                            'url': url,
+                            'summary': summary
+                        })
+                    else:
+                        logger.debug(f"Summary deemed not valuable for URL: {url}")
+                        sub_task_outcomes.append({
+                            'url': url,
+                            'summary': summary,
+                            'valuable': False
+                        })
                 else:
                     logger.warning(f"No structured data extracted from URL: {url}")
                     sub_task_outcomes.append({
@@ -303,6 +358,14 @@ def process_task(task: Dict[str, Any], question_id: int, question_text: str, con
                     "confidence": confidence,
                     "sources": sources
                 })
+        elif task_name == 'evaluate_summary':
+            # This task is specifically for evaluating the value of a summary
+            is_valuable = outcome.get("is_valuable", True)
+            sub_task_outcomes.append({
+                "task_name": task_name,
+                "is_valuable": is_valuable
+            })
+        # Add more task-specific handling as needed
 
     # Return the final outcome, possibly including sub_task_outcomes
     return {
