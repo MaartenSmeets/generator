@@ -15,9 +15,6 @@ from rake_nltk import Rake
 import subprocess
 from llm_utils import send_llm_request
 import logging
-from io import BytesIO
-import torch
-from transformers import BlipProcessor, BlipForConditionalGeneration
 from huggingface_hub import hf_hub_download
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -37,6 +34,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import random
 from lxml import html, etree
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
 
 # -------------------- Logging Configuration --------------------
 
@@ -113,7 +111,7 @@ except OSError:
 OLLAMA_URL = "http://localhost:11434/api/generate"  # Replace with your actual endpoint
 SUMMARIZER_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Configurable summarizer model name
 IS_REPUTABLE_SOURCE_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Replace with your desired model name
-IS_CONTENT_VALUABLE_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Configurable model name for content validation
+IS_CONTENT_VALUABLE_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for content validation
 EVALUATE_QUESTION_FOCUS_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Configurable model name for question focus evaluation
 
 # -------------------- Task Definitions --------------------
@@ -268,6 +266,51 @@ def search_query(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, An
 
 TASK_FUNCTIONS["search_query"] = search_query
 
+def fetch_youtube_transcript(url: str) -> Dict[str, Any]:
+    """
+    Fetch the transcript of a YouTube video given its URL.
+
+    Args:
+        url (str): The YouTube video URL.
+
+    Returns:
+        Dict[str, Any]: A dictionary containing the transcript text or an error message.
+    """
+    logger.debug(f"Fetching YouTube transcript for URL: {url}")
+    try:
+        # Extract the video ID from the URL
+        parsed_url = urlparse(url)
+        if 'youtube.com' in parsed_url.netloc:
+            query_params = dict([part.split('=') for part in parsed_url.query.split('&') if '=' in part])
+            video_id = query_params.get('v')
+        elif 'youtu.be' in parsed_url.netloc:
+            video_id = parsed_url.path.lstrip('/')
+        else:
+            logger.error("Invalid YouTube URL format.")
+            return {"error": "Invalid YouTube URL format."}
+        
+        if not video_id:
+            logger.error("Video ID not found in the URL.")
+            return {"error": "Video ID not found in the URL."}
+        
+        # Fetch the transcript using YouTubeTranscriptApi
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+        transcript_text = " ".join([entry['text'] for entry in transcript_list])
+        logger.debug("Transcript fetched successfully.")
+        return {"transcript": transcript_text}
+    except VideoUnavailable:
+        logger.error("The video is unavailable.")
+        return {"error": "The video is unavailable."}
+    except TranscriptsDisabled:
+        logger.error("Transcripts are disabled for this video.")
+        return {"error": "Transcripts are disabled for this video."}
+    except NoTranscriptFound:
+        logger.error("No transcript found for this video.")
+        return {"error": "No transcript found for this video."}
+    except Exception as e:
+        logger.exception("An unexpected error occurred while fetching the transcript.")
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
 def extract_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     import hashlib
     url = task_params.get('url')
@@ -280,133 +323,156 @@ def extract_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
         logger.error("No question provided for content extraction.")
         return {'error': "No question provided for content extraction."}
 
-    # Initialize variables
-    page_source = None
-    response = None
+    # Check if the URL is a YouTube link
+    parsed_url = urlparse(url)
+    is_youtube = False
+    if 'youtube.com' in parsed_url.netloc or 'youtu.be' in parsed_url.netloc:
+        is_youtube = True
 
-    # Capture a screenshot and get page source of the webpage
     try:
-        screenshot, page_source = capture_screenshot(url)
-        logger.debug("Captured screenshot and page source of the webpage.")
-
-        # Generate a unique filename using a hash of the URL
-        parsed_url = urlparse(url)
-        domain = parsed_url.netloc
-
-        # Create a hash of the URL to use as filename
-        url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
-
-        filename = f"{domain}_{url_hash}.png"
-        logger.debug(f"Generated filename for image: {filename}")
-
-        # Define the output directory
-        images_dir = os.path.join('output', 'images')
-        os.makedirs(images_dir, exist_ok=True)
-        logger.debug(f"Images directory: {images_dir}")
-
-        # Define the full path to save the image
-        img_path = os.path.join(images_dir, filename)
-        logger.debug(f"Full image path: {img_path}")
-
-        # Save the screenshot
-        with open(img_path, 'wb') as f:
-            f.write(screenshot)
-        logger.debug("Screenshot saved.")
-
-        draw_bbox_config = {
-            'text_scale': 0.8,
-            'text_thickness': 2,
-            'text_padding': 3,
-            'thickness': 3,
-        }
-        BOX_THRESHOLD = 0.03
-
-        logger.debug("Starting OCR processing.")
-        try:
-            ocr_bbox_rslt, is_goal_filtered = check_ocr_box(
-                image_path=img_path,
-                display_img=False,
-                output_bb_format='xyxy',
-                goal_filtering=None,
-                easyocr_args={'paragraph': False, 'text_threshold': 0.9},
-                use_paddleocr=True
-            )
-            if ocr_bbox_rslt is None:
-                logger.error("OCR bbox result is None.")
-                raise ValueError("OCR bbox result is None.")
-            text, ocr_bbox = ocr_bbox_rslt
-            logger.debug(f"OCR text length: {len(text)}, number of OCR boxes: {len(ocr_bbox)}")
-
-            logger.debug("Starting SOM label extraction.")
-            som_result = get_som_labeled_img(
-                img_path=img_path,
-                model=som_model,
-                BOX_TRESHOLD=BOX_THRESHOLD,
-                output_coord_in_ratio=False,
-                ocr_bbox=ocr_bbox,  # Pass the actual OCR bounding boxes
-                draw_bbox_config=draw_bbox_config,
-                caption_model_processor=caption_model_processor,
-                ocr_text=text,  # Pass the extracted text
-                use_local_semantics=True,
-                iou_threshold=0.1
-            )
-            if som_result is None:
-                logger.error("SOM labeled image result is None.")
-                raise ValueError("SOM labeled image result is None.")
-            dino_labeled_img, label_coordinates, parsed_content_list = som_result
-            logger.debug(f"Parsed content list length: {len(parsed_content_list)}")
-
-            # Assign extracted text for validation
-            extracted_text = parsed_content_list
-
-        except Exception as e:
-            logger.exception("An error occurred during OCR processing. Falling back to processing page source or response content.")
-
-            # Try to use page_source from Selenium
-            if page_source:
-                logger.debug("Using page source from Selenium to extract content.")
-                content_to_process = page_source
+        if is_youtube:
+            logger.debug("Detected YouTube URL. Attempting to fetch transcript.")
+            transcript_result = fetch_youtube_transcript(url)
+            if 'transcript' in transcript_result:
+                extracted_text = transcript_result['transcript']
+                logger.debug("Transcript obtained successfully.")
             else:
-                logger.debug("Fetching URL content via requests.")
-                headers = {'User-Agent': 'Mozilla/5.0'}
+                logger.error(f"Failed to fetch transcript: {transcript_result.get('error')}")
+                return {'error': f"Failed to fetch transcript: {transcript_result.get('error')}"}
+        else:
+            # Initialize variables
+            page_source = None
+            response = None
+
+            # Capture a screenshot and get page source of the webpage
+            try:
+                screenshot, page_source = capture_screenshot(url)
+                logger.debug("Captured screenshot and page source of the webpage.")
+
+                # Generate a unique filename using a hash of the URL
+                domain = parsed_url.netloc
+
+                # Create a hash of the URL to use as filename
+                url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
+
+                filename = f"{domain}_{url_hash}.png"
+                logger.debug(f"Generated filename for image: {filename}")
+
+                # Define the output directory
+                images_dir = os.path.join('output', 'images')
+                os.makedirs(images_dir, exist_ok=True)
+                logger.debug(f"Images directory: {images_dir}")
+
+                # Define the full path to save the image
+                img_path = os.path.join(images_dir, filename)
+                logger.debug(f"Full image path: {img_path}")
+
+                # Save the screenshot
+                with open(img_path, 'wb') as f:
+                    f.write(screenshot)
+                logger.debug("Screenshot saved.")
+
+                draw_bbox_config = {
+                    'text_scale': 0.8,
+                    'text_thickness': 2,
+                    'text_padding': 3,
+                    'thickness': 3,
+                }
+                BOX_THRESHOLD = 0.03
+
+                logger.debug("Starting OCR processing.")
                 try:
-                    response = requests.get(url, headers=headers)
-                    response.raise_for_status()
-                    logger.debug(f"Successfully fetched URL via requests: {url}")
-                    content_to_process = response.content
-                except requests.RequestException as e:
-                    logger.exception(f"Failed to fetch URL via requests: {url}")
-                    content_to_process = None
+                    ocr_bbox_rslt, is_goal_filtered = check_ocr_box(
+                        image_path=img_path,
+                        display_img=False,
+                        output_bb_format='xyxy',
+                        goal_filtering=None,
+                        easyocr_args={'paragraph': False, 'text_threshold': 0.9},
+                        use_paddleocr=True
+                    )
+                    if ocr_bbox_rslt is None:
+                        logger.error("OCR bbox result is None.")
+                        raise ValueError("OCR bbox result is None.")
+                    text, ocr_bbox = ocr_bbox_rslt
+                    logger.debug(f"OCR text length: {len(text)}, number of OCR boxes: {len(ocr_bbox)}")
 
-            if content_to_process:
-                # Clean the content
-                cleaned_html = clean_html_content(content_to_process)
-                logger.debug("Cleaned HTML content.")
+                    logger.debug("Starting SOM label extraction.")
+                    som_result = get_som_labeled_img(
+                        img_path=img_path,
+                        model=som_model,
+                        BOX_TRESHOLD=BOX_THRESHOLD,
+                        output_coord_in_ratio=False,
+                        ocr_bbox=ocr_bbox,  # Pass the actual OCR bounding boxes
+                        draw_bbox_config=draw_bbox_config,
+                        caption_model_processor=caption_model_processor,
+                        ocr_text=text,  # Pass the extracted text
+                        use_local_semantics=True,
+                        iou_threshold=0.1
+                    )
+                    if som_result is None:
+                        logger.error("SOM labeled image result is None.")
+                        raise ValueError("SOM labeled image result is None.")
+                    dino_labeled_img, label_coordinates, parsed_content_list = som_result
+                    logger.debug(f"Parsed content list length: {len(parsed_content_list)}")
 
-                # Extract text from the cleaned html
-                text_content = extract_text_from_html(cleaned_html)
-                logger.debug("Extracted text from cleaned HTML.")
+                    # Assign extracted text for validation
+                    extracted_text = parsed_content_list
 
-                # Cleanup the extracted text
-                text_content = cleanup_extracted_text(text_content)
-                logger.debug("Cleaned up extracted text.")
+                except Exception as e:
+                    logger.exception("An error occurred during OCR processing. Falling back to processing page source or response content.")
 
-                # Assign extracted text for validation
-                extracted_text = text_content
-            else:
-                logger.error("No content available to extract.")
-                return {'error': "No content available to extract."}
+                    # Try to use page_source from Selenium
+                    if page_source:
+                        logger.debug("Using page source from Selenium to extract content.")
+                        content_to_process = page_source
+                    else:
+                        logger.debug("Fetching URL content via requests.")
+                        headers = {'User-Agent': 'Mozilla/5.0'}
+                        try:
+                            response = requests.get(url, headers=headers)
+                            response.raise_for_status()
+                            logger.debug(f"Successfully fetched URL via requests: {url}")
+                            content_to_process = response.content
+                        except requests.RequestException as e:
+                            logger.exception(f"Failed to fetch URL via requests: {url}")
+                            content_to_process = None
+
+                    if content_to_process:
+                        # Clean the content
+                        cleaned_html = clean_html_content(content_to_process)
+                        logger.debug("Cleaned HTML content.")
+
+                        # Extract text from the cleaned html
+                        text_content = extract_text_from_html(cleaned_html)
+                        logger.debug("Extracted text from cleaned HTML.")
+
+                        # Cleanup the extracted text
+                        text_content = cleanup_extracted_text(text_content)
+                        logger.debug("Cleaned up extracted text.")
+
+                        # Assign extracted text for validation
+                        extracted_text = text_content
+                    else:
+                        logger.error("No content available to extract.")
+                        return {'error': "No content available to extract."}
+
+            except Exception as e:
+                logger.exception("An error occurred during content extraction.")
+                return {'error': f"An error occurred during content extraction: {str(e)}"}
 
         # Validate the extracted content using LLM via execute_task
         is_valuable_result = execute_task("is_content_valuable", {"extracted_text": extracted_text, "question": question}, cache)
-        if not is_valuable_result.get("is_valuable"):
+        if "error" in is_valuable_result:
+            logger.error(f"Content validation failed: {is_valuable_result['error']}")
+            return {'error': f"Content validation failed: {is_valuable_result['error']}"}
+
+        is_valuable = is_valuable_result.get("is_valuable", False)
+        if not is_valuable:
             logger.debug("Extracted content is not valuable for answering the question.")
-            return {'error': "Extracted content is not valuable for answering the question."}
+            return {'is_valuable': False, "structured_data": extracted_text}
         else:
             logger.debug("Extracted content is valuable.")
-
-        # Proceed to return the structured data
-        return {'structured_data': extracted_text}
+            return {'is_valuable': True, "structured_data": extracted_text}
     except Exception as e:
         logger.exception("An error occurred during content extraction.")
         return {'error': f"An error occurred during content extraction: {str(e)}"}
@@ -425,13 +491,24 @@ def is_content_valuable(task_params: Dict[str, Any], cache: Any = None) -> Dict[
         "Determine whether the following content is valuable for answering the given question. "
         "Content that is a denial, a warning notice, a cookie policy, or an empty page should be considered not valuable.\n\n"
         f"Question:\n{question}\n\nContent:\n{extracted_text}\n\n"
-        "Is the content valuable for answering the question? Answer 'Yes' or 'No'."
+        "Is the content valuable for answering the question? Answer with only 'Yes' or 'No'."
     )
     try:
         response = send_llm_request(prompt, cache, IS_CONTENT_VALUABLE_MODEL_NAME, OLLAMA_URL, expect_json=False)
         answer = response.strip().lower()
-        logger.debug(f"LLM validation response: {answer}")
-        is_valuable = 'yes' in answer
+        logger.debug(f"LLM validation response: '{answer}'")
+
+        # Extract the first word to determine the answer
+        first_word = answer.split()[0] if answer else ''
+        if first_word == 'yes':
+            is_valuable = True
+        elif first_word == 'no':
+            is_valuable = False
+        else:
+            logger.warning(f"Unexpected LLM response format: '{response}'. Defaulting to 'Not Valuable'.")
+            is_valuable = False  # Default to not valuable if response is unexpected
+
+        logger.debug(f"Parsed 'is_valuable': {is_valuable}")
         return {"is_valuable": is_valuable}
     except Exception as e:
         logger.exception("An error occurred during content validation.")
@@ -923,7 +1000,7 @@ def evaluate_question_focus(task_params: Dict[str, Any], cache: Any = None) -> D
 
     prompt = (
         "Determine whether the following question is focused and detailed enough to be considered a single-topic question. "
-        "A focused question should be specific, clear, and centered around one main topic without multiple unrelated subtopics. "
+        "A focused question should be specific, clear, and centered around one main topic without multiple unrelated subtopics. It should not be abstract but concrete and answerable.\n\n"
         "Provide a simple 'Yes' or 'No' answer.\n\n"
         f"Question:\n{question}\n\nIs this question focused and detailed on a single topic? Answer 'Yes' or 'No'."
     )

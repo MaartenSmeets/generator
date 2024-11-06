@@ -70,8 +70,8 @@ def generate_tasks_and_subquestions(question_text: str, cache: Any) -> (str, Lis
                 "For each sub-question, consider what tasks might be necessary to answer it, such as performing search queries, extracting content, summarizing information, etc. "
                 "Generate a list of tasks with appropriate parameters needed to answer the sub-questions and the main question. "
                 "Note that the 'search_query' task can accept an optional 'from_date' parameter (can only be 'past month' or 'past year') to limit search results to recent information. Use this parameter when it is important to get the latest data. "
-                "Return ONLY valid JSON with three keys: 'answer' (a string, can be empty), 'tasks' (a list of dictionaries with 'name' and 'parameters'), 'subquestions' (a list of strings). "
-                "Ensure that tasks are practical and can be executed by the system. No additional text or explanations."
+                "Return ONLY valid JSON with three keys: 'answer' (a string, can be empty), 'tasks' (a list of dictionaries with 'name' and 'parameters'), 'subquestions' (a list of strings). Ensure the JSON is enclosed within a code block labeled as json. Do not include any additional text or explanations."
+                "\n\n**Example:**\n```json\n{\n  \"answer\": \"\",\n  \"tasks\": [\n    {\"name\": \"search_query\", \"parameters\": {\"query\": \"AI hardware advancements October 2024\", \"from_date\": \"past month\"}},\n    {\"name\": \"extract_content\", \"parameters\": {\"url\": \"https://example.com/ai-hardware\", \"question\": \"...\"}}\n  ],\n  \"subquestions\": [\n    \"What are the recent advancements in AI hardware in October 2024?\",\n    \"...\"\n  ]\n}\n```"
             ),
             "parameters": {"question": question_text},
             "task_list": task_list,
@@ -83,6 +83,12 @@ def generate_tasks_and_subquestions(question_text: str, cache: Any) -> (str, Lis
     answer = response.get("answer", "")
     tasks_data = response.get("tasks", [])
     sub_questions = response.get("subquestions", [])
+    
+    if not sub_questions:
+        logger.error("Failed to generate sub-questions. The response was empty or improperly formatted.")
+    else:
+        logger.debug(f"Generated sub-questions: {sub_questions}")
+
     return answer, tasks_data, sub_questions
 
 def generate_answer_from_context(context: Dict[str, Any], cache: Any) -> str:
@@ -153,7 +159,8 @@ def generate_subquestions(question_text: str, cache: Any) -> List[str]:
         "subquestion_generation": {
             "description": (
                 "Please analyze the question below and decompose it into smaller, more specific sub-questions that can help in answering the main question comprehensively. "
-                "Return ONLY valid JSON with one key: 'subquestions' (a list of strings). No additional text or explanations."
+                "Return ONLY valid JSON with one key: 'subquestions' (a list of strings). Ensure the JSON is enclosed within a code block labeled as json. Do not include any additional text or explanations."
+                "\n\n**Example:**\n```json\n{\n  \"subquestions\": [\n    \"What are the recent advancements in AI hardware in October 2024?\",\n    \"What new AI software models were released in October 2024?\",\n    \"What significant open-source AI contributions were made in October 2024?\",\n    \"How do these advancements impact the AI industry overall?\"\n  ]\n}\n```"
             ),
             "parameters": {"question": question_text}
         }
@@ -161,6 +168,12 @@ def generate_subquestions(question_text: str, cache: Any) -> List[str]:
     prompt_str = json.dumps(prompt)
     response = send_llm_request(prompt_str, cache, TASK_GENERATION_MODEL_NAME, OLLAMA_URL, expect_json=True)
     sub_questions = response.get("subquestions", [])
+
+    if not sub_questions:
+        logger.error("Failed to generate sub-questions. The response was empty or improperly formatted.")
+    else:
+        logger.debug(f"Generated sub-questions: {sub_questions}")
+
     return sub_questions
 
 # -------------------- Task Execution --------------------
@@ -461,7 +474,24 @@ if __name__ == '__main__':
     with shelve.open(CACHE_FILE) as cache:
         try:
             # Define the main question
-            question_text = "what is the meaning of life"
+            question_text = """**Objective**: Create an elaborate complete markdown report detailing advancements in artificial intelligence only in October 2024, covering hardware, software, open-source developments and emerging trends (focus multiple large companies have shown recently) from reputable and credible sources. Ensure the report highlights recent trends and innovations that reflect the latest industry shifts and focus areas. Each statement should include online references to credible sources. Structure the report to appeal to a broad audience, including both technical and strategic stakeholders. Each section should be engaging, visual, and supported by concrete data from authoritative sources, preferably the official announcements, technical documentation, or product pages of the service providers or manufacturers.
+                **AI Hardware Advancements**: 
+                - Present major updates in AI-specific hardware, focusing on recent breakthroughs and trends:
+                    - Summarize upcoming releases or breakthroughs (e.g., new NVIDIA GPUs, Apple’s chips, advancements in edge AI hardware).
+                    - Provide performance comparisons to previous models to highlight improvements, efficiency gains, or scalability enhancements.
+                    - Include new use cases or efficiency gains expected from these advancements, and discuss how they reflect recent industry trends.
+                **Software Innovations**: 
+                - Outline cutting-edge software models and updates, including popular trends in AI applications:
+                    - Detail improvements in reasoning, multimodal capabilities, and efficiency with models like OpenAI’s GPT, Meta’s Llama, Google’s Gemini, and others that are driving new AI capabilities.
+                    - Emphasize recent developments in responsible AI, ethical AI practices, and any alignment improvements in popular models.
+                    - Include relevant benchmarks, unique features (such as increased context windows, enhanced image/video processing), and visual comparisons, highlighting recent improvements and trends.
+                **Open-Source Contributions**: 
+                - Showcase significant open-source AI releases, focusing on recent contributions and trends. Consider for example new open models and AI related frameworks. Consider LLMs and image generation models and other types when applicable.:
+                    - Highlight contributions from companies like Meta, Microsoft, Google, and others, explaining the anticipated impact and what is innovative about these tools.
+                    - Include real-world applications and potential impact, particularly in underrepresented regions or for solving specific societal challenges, showcasing the relevance to current global AI trends.
+                **Validation and Accuracy**: 
+                - Ensure all data points are accurate, verified, and from reputable sources. Avoid unverified claims by cross-referencing with multiple credible sources, primarily direct statements from the companies or technical documentation.
+            """
             logger.info(f"Main question: {question_text}")
 
             # Insert the main question into the database
