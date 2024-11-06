@@ -1192,7 +1192,7 @@ def evaluate_summary(task_params: Dict[str, Any], cache: Any = None) -> Dict[str
 
     prompt = (
         "Determine whether the following summary is valuable for inclusion in the final answer to the given question. "
-        "A valuable summary should be relevant, concise, and provide clear insights that directly address the question. "
+        "A valuable summary should be relevant, concise, and provide clear insights that directly address the question. An error message, a security warning or a cookie policy is not valuable. But news relevant to answering the question is\n\n"
         "Avoid summaries that are off-topic, too vague, or redundant.\n\n"
         f"Question:\n{question}\n\nSummary:\n{summary}\n\n"
         "Is this summary valuable for the final answer? Answer with only 'Yes' or 'No'."
