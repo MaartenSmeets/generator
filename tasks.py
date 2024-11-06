@@ -111,11 +111,11 @@ except OSError:
 # -------------------- Constants --------------------
 
 OLLAMA_URL = "http://localhost:11434/api/generate"  # Replace with your actual endpoint
-SUMMARIZER_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Configurable summarizer model name
-IS_REPUTABLE_SOURCE_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Replace with your desired model name
+SUMMARIZER_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable summarizer model name
+IS_REPUTABLE_SOURCE_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Replace with your desired model name
 IS_CONTENT_VALUABLE_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for content validation
-EVALUATE_QUESTION_FOCUS_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Configurable model name for question focus evaluation
-EVALUATE_SUMMARY_MODEL_NAME = "llama3.1:8b-instruct-fp16"  # Configurable model name for summary evaluation
+EVALUATE_QUESTION_FOCUS_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for question focus evaluation
+EVALUATE_SUMMARY_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for summary evaluation
 
 # -------------------- Task Definitions --------------------
 
@@ -956,7 +956,7 @@ def summarize_text(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, 
         return {"error": "No question provided for summarization."}
 
     prompt = (
-        "Provide a summary of the following text, focusing on relevant information for answering the given question. "
+        "Provide a summary of the following text, focusing on relevant information for answering the given question. Be detailed/specific on suppliers, products, capabilities, and other key details such as strategy and vision.\n\n"
         "Do not include any introductions, comments about the summarization process, or closing remarks.\n\n"
         f"Question:\n{question}\n\nText:\n{text}\n\nSummary:"
     )
