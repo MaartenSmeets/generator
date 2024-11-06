@@ -20,6 +20,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
+import undetected_chromedriver as uc
 import time
 from utils import (
     get_som_labeled_img,
@@ -527,10 +528,15 @@ def capture_screenshot(url: str) -> (bytes, str):
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--window-size=1920,1080")  # Set initial window size
+    chrome_options.add_argument("--window-size=1920,1080")
 
-    # Initialize the Chrome WebDriver
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    # Initialize the undetected Chrome WebDriver with use_subprocess=True
+    try:
+        logger.debug("Initializing undetected_chromedriver with subprocess.")
+        driver = uc.Chrome(options=chrome_options, use_subprocess=True)
+    except Exception as e:
+        logger.exception("Failed to initialize undetected_chromedriver with subprocess.")
+        raise
 
     try:
         # Navigate to the specified URL
@@ -542,7 +548,7 @@ def capture_screenshot(url: str) -> (bytes, str):
             EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
         logger.debug("Page loaded successfully.")
-
+        
         # Attempt to click away cookie banners
         try:
             # Find cookie buttons with refined criteria for "accept" and similar terms
@@ -567,15 +573,21 @@ def capture_screenshot(url: str) -> (bytes, str):
                     # Check if the button is visible and clickable
                     if WebDriverWait(driver, 5).until(EC.visibility_of(cookie_button)) and \
                        WebDriverWait(driver, 5).until(EC.element_to_be_clickable(cookie_button)):
-                        # Simulate realistic mouse movement and randomized delay
+                        logger.debug("Found clickable, visible cookie pop-up button, attempting natural mouse movement click")
+                        # Attempt to click using natural mouse movement
                         simulate_human_mouse_movement(driver, cookie_button)
-                        logger.debug("Found clickable, visible cookie pop-up button, attempting to click it")
-                        cookie_button.click()
-
-                        # Wait for it to disappear to confirm it's the correct button
-                        WebDriverWait(driver, 5).until(EC.invisibility_of_element(cookie_button))
-                        logger.debug("Cookie pop-up disappeared successfully")
-                        break  # Exit after successfully handling one cookie banner
+                        try:
+                            # Wait for the cookie banner to disappear
+                            WebDriverWait(driver, 5).until(EC.invisibility_of_element(cookie_button))
+                            logger.debug("Cookie pop-up disappeared successfully via natural mouse movement click")
+                            break  # Exit after successfully handling one cookie banner
+                        except Exception as e:
+                            logger.debug(f"Natural mouse movement click failed: {e}, attempting programmatic click")
+                            # If natural click fails, attempt programmatic click
+                            cookie_button.click()
+                            WebDriverWait(driver, 5).until(EC.invisibility_of_element(cookie_button))
+                            logger.debug("Cookie pop-up disappeared successfully via programmatic click")
+                            break  # Exit after successfully handling one cookie banner
                 except Exception as e:
                     logger.debug(f"Could not click the button or button did not disappear: {e}")
         except Exception as e:
@@ -617,8 +629,11 @@ def capture_screenshot(url: str) -> (bytes, str):
         raise
     finally:
         # Close the WebDriver
-        driver.quit()
-        logger.debug("WebDriver closed.")
+        try:
+            driver.quit()
+            logger.debug("WebDriver closed successfully.")
+        except Exception as e:
+            logger.warning(f"An error occurred while quitting the WebDriver: {e}")
 
 def simulate_human_mouse_movement(driver, element):
     """
