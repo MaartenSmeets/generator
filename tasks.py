@@ -429,7 +429,7 @@ def extract_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
                 # Write the extracted transcript to a text file
                 filename = f"{domain}_{url_hash}_{method_name}.txt"
                 filename = re.sub(r'\W+', '_', filename)  # Sanitize filename
-                file_path = os.path.join(output_dir, filename)
+                file_path = os.path.join(images_dir, filename)
                 with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(transcript_result['transcript'])
                 logger.debug(f"Transcript written to {file_path}")
@@ -455,7 +455,7 @@ def extract_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
                 # Write the extracted text to a text file
                 filename = f"{domain}_{url_hash}_{method_name}.txt"
                 filename = re.sub(r'\W+', '_', filename)  # Sanitize filename
-                file_path = os.path.join(output_dir, filename)
+                file_path = os.path.join(images_dir, filename)
                 with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(cleaned_text)
                 logger.debug(f"Extracted text from Method 1 written to {file_path}")
@@ -537,7 +537,7 @@ def extract_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
                         # Write the extracted content to a text file
                         filename = f"{domain}_{url_hash}_{method_name}.txt"
                         filename = re.sub(r'\W+', '_', filename)  # Sanitize filename
-                        file_path = os.path.join(output_dir, filename)
+                        file_path = os.path.join(images_dir, filename)
                         with open(file_path, 'w', encoding='utf-8') as f:
                             f.write(json.dumps(parsed_content_list, indent=2))
                         logger.debug(f"Extracted content from Method 2 written to {file_path}")
@@ -559,7 +559,7 @@ def extract_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
                     # Write the extracted text to a text file
                     filename = f"{domain}_{url_hash}_{method_name}.txt"
                     filename = re.sub(r'\W+', '_', filename)  # Sanitize filename
-                    file_path = os.path.join(output_dir, filename)
+                    file_path = os.path.join(images_dir, filename)
                     with open(file_path, 'w', encoding='utf-8') as f:
                         f.write(extracted_text_pytesseract)
                     logger.debug(f"Extracted text from Method 3 written to {file_path}")
@@ -581,7 +581,7 @@ def extract_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
                     # Write the extracted text to a text file
                     filename = f"{domain}_{url_hash}_{method_name}.txt"
                     filename = re.sub(r'\W+', '_', filename)  # Sanitize filename
-                    file_path = os.path.join(output_dir, filename)
+                    file_path = os.path.join(images_dir, filename)
                     with open(file_path, 'w', encoding='utf-8') as f:
                         f.write(page_source_content_result['extracted_text'])
                     logger.debug(f"Extracted text from Method 4 written to {file_path}")
