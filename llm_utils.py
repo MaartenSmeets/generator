@@ -55,7 +55,7 @@ def send_llm_request(prompt, cache, model_name, api_url, expect_json=True):
                 cache[cache_key] = llm_response  # Save to persistent cache
                 return llm_response
             else:
-                logger.error("Failed to extract JSON from accumulated response.")
+                logger.error(f"Failed to extract JSON from accumulated response: {response_text}")
                 return {}  # Default to empty dict if JSON not found
         else:
             cache[cache_key] = response_text.strip()
