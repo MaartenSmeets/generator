@@ -44,10 +44,11 @@ if not logger.handlers:
 # -------------------- Constants --------------------
 
 OLLAMA_URL = "http://localhost:11434/api/generate"  # Replace with your actual endpoint
-TASK_GENERATION_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for task generation
-ANSWER_GENERATION_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for answer generation
+TASK_GENERATION_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable model name for task generation
+ANSWER_GENERATION_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable model name for answer generation
 CACHE_FILE = os.path.join("output", 'cache.db')
 MAX_ATTEMPTS = 3
+MAX_DEPTH = 4
 
 # -------------------- Helper Functions --------------------
 
@@ -135,7 +136,7 @@ class TaskManager:
                         'error': extract_outcome['outcome']['error']
                     })
                     continue
-                structured_data = extract_outcome.get('outcome', {}).get('structured_data')
+                structured_data = extract_outcome.get('outcome', {}).get('extracted_text')  # Assuming 'extracted_text' instead of 'structured_data'
                 if structured_data:
                     # Summarize Text Task
                     summarize_task = {
@@ -177,10 +178,10 @@ class TaskManager:
                             'valuable': False
                         })
                 else:
-                    logger.warning(f"No structured data extracted from URL: {url}")
+                    logger.warning(f"No extracted text from URL: {url}")
                     sub_task_outcomes.append({
                         'url': url,
-                        'error': 'No structured data extracted'
+                        'error': 'No extracted text.'
                     })
 
         elif task_name in ['validate_fact', 'is_reputable_source', 'evaluate_summary']:
@@ -205,35 +206,31 @@ class AnswerGenerator:
 
     def generate_answer_from_context(self, context: Dict[str, Any]) -> str:
         logger.debug("Generating answer from context.")
-        prompt = {
-            "answer_generation": {
-                "description": (
-                    "Based on the provided context, which includes the question, tasks with their parameters and outcomes, and sub-answers, generate an answer to the question. "
-                    "Ensure all sources are verified and include concrete URL references. "
-                    "Return ONLY valid JSON with one key: 'answer' (a string). No additional text or explanations."
-                ),
-                "parameters": context
-            }
-        }
-        prompt_str = json.dumps(prompt)
+        prompt = (
+            "Based on the provided context, which includes the question, tasks with their parameters and outcomes, "
+            "and sub-answers, generate an answer to the question. Ensure all sources are verified and include concrete "
+            "URL references. Return ONLY valid JSON with one key: 'answer' (a string). No additional text or explanations.\n\n"
+            "Example:\n"
+            "```json\n"
+            "{\n"
+            '  "answer": "Your generated answer here."\n'
+            "}\n"
+            "```"
+        )
+        prompt += f"\nContext:\n{json.dumps(context, indent=2)}\n\nAnswer:"
 
         try:
-            response = send_llm_request(prompt_str, self.cache, ANSWER_GENERATION_MODEL_NAME, OLLAMA_URL, expect_json=False)
-            logger.debug(f"Raw LLM response: {response}")
+            response = send_llm_request(
+                prompt,
+                self.cache,
+                ANSWER_GENERATION_MODEL_NAME,
+                OLLAMA_URL,
+                expect_json=True  # Expecting a JSON response
+            )
+            logger.debug(f"LLM response for answer generation: {response}")
 
-            # Extract JSON from response
-            json_start = response.find('{')
-            json_end = response.rfind('}') + 1
-            if json_start == -1 or json_end == -1:
-                logger.error("No JSON object found in the LLM response.")
-                return ""
-
-            json_str = response[json_start:json_end]
-            logger.debug(f"Extracted JSON string: {json_str}")
-
-            # Parse JSON
-            parsed_response = json.loads(json_str)
-            answer = parsed_response.get("answer", "")
+            # Validate and extract the 'answer' field from the JSON response
+            answer = response.get("answer", "")
             if not isinstance(answer, str):
                 logger.error("The 'answer' field is missing or not a string in the JSON response.")
                 return ""
@@ -254,6 +251,23 @@ class QuestionProcessor:
         self.cache = cache
         self.task_manager = TaskManager(conn, cache)
         self.answer_generator = AnswerGenerator(cache)
+
+    def get_question_depth(self, question_id: int) -> int:
+        """
+        Helper method to determine the depth of a question in the hierarchy.
+        The main question has a depth of 0.
+        """
+        depth = 0
+        current_id = question_id
+        while True:
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT parent_id FROM Questions WHERE id = ?', (current_id,))
+            row = cursor.fetchone()
+            if not row or not row[0]:
+                break
+            depth += 1
+            current_id = row[0]
+        return depth
 
     def process_question(self, question_id: int, attempts: int = 0) -> Optional[str]:
         cursor = self.conn.cursor()
@@ -277,8 +291,41 @@ class QuestionProcessor:
             database.update_question_status(self.conn, question_id, 'unanswerable')
             return None
 
+        # Determine the current depth of the question
+        current_depth = self.get_question_depth(question_id)
+        logger.debug(f"Current question depth: {current_depth}")
+
+        # If the maximum depth is reached, do not generate subquestions
+        if current_depth >= MAX_DEPTH:
+            logger.debug(f"Maximum question depth {MAX_DEPTH} reached. Skipping subquestion generation.")
+            # Attempt to generate an answer directly
+            combined_context = {
+                'question': question_text,
+                'tasks': [],
+                'sub_answers': []
+            }
+            answer = self.answer_generator.generate_answer_from_context(combined_context)
+            if answer:
+                # Validate if the answer indicates unanswerable
+                is_unanswerable = self.validate_answer(question_text, answer)
+                if is_unanswerable is None:
+                    logger.error("Failed to validate answer. Marking question as unanswerable.")
+                    database.update_question_status(self.conn, question_id, 'unanswerable')
+                    return None
+                elif is_unanswerable:
+                    logger.info("Answer indicates the question is unanswerable.")
+                    database.update_question_status(self.conn, question_id, 'unanswerable')
+                    return None
+                else:
+                    database.update_question_status(self.conn, question_id, 'answered', answer)
+                    return answer
+
+            logger.debug("Unable to generate answer at maximum depth.")
+            database.update_question_status(self.conn, question_id, 'unanswerable')
+            return None
+
         # Step 1: Extract keywords from the question
-        keywords = self.extract_keywords(question_text)
+        keywords = self.extract_keywords(question_id, question_text)
         if keywords is None:
             logger.error("Failed to extract keywords.")
             database.update_question_status(self.conn, question_id, 'unanswerable')
@@ -286,7 +333,7 @@ class QuestionProcessor:
         logger.debug(f"Extracted keywords: {keywords}")
 
         # Step 2: Evaluate if the question is focused
-        is_focused = self.evaluate_question_focus(question_text)
+        is_focused = self.evaluate_question_focus(question_id, question_text)
         logger.debug(f"Is the question focused? {is_focused}")
 
         task_outcomes = []
@@ -310,27 +357,38 @@ class QuestionProcessor:
             }
             answer = self.answer_generator.generate_answer_from_context(combined_context)
             if answer:
-                database.update_question_status(self.conn, question_id, 'answered', answer)
-                return answer
+                # Validate if the answer indicates unanswerable
+                is_unanswerable = self.validate_answer(question_text, answer)
+                if is_unanswerable is None:
+                    logger.error("Failed to validate answer. Marking question as unanswerable.")
+                    database.update_question_status(self.conn, question_id, 'unanswerable')
+                    return None
+                elif is_unanswerable:
+                    logger.info("Answer indicates the question is unanswerable.")
+                    database.update_question_status(self.conn, question_id, 'unanswerable')
+                    return None
+                else:
+                    database.update_question_status(self.conn, question_id, 'answered', answer)
+                    return answer
 
             logger.debug("Unable to generate answer from initial tasks, generating subquestions.")
         else:
             logger.debug("Question is not focused. Generating subquestions.")
 
-        # Generate subquestions
-        sub_questions = self.generate_subquestions(question_text)
-        logger.debug(f"Generated sub-questions: {sub_questions}")
+            # Generate subquestions
+            sub_questions = self.generate_subquestions(question_id, question_text)
+            logger.debug(f"Generated sub-questions: {sub_questions}")
 
-        # Process sub-questions
-        for sub_question_text in sub_questions:
-            sub_question_id = self.get_or_create_subquestion(sub_question_text, question_id)
-            sub_answer = self.process_question(sub_question_id, attempts=attempts + 1)
-            if sub_answer:
-                sub_answers.append(sub_answer)
-            else:
-                sub_answers.append(f"Could not find an answer to sub-question: {sub_question_text}")
+            # Process sub-questions
+            for sub_question_text in sub_questions:
+                sub_question_id = self.get_or_create_subquestion(sub_question_text, question_id)
+                sub_answer = self.process_question(sub_question_id, attempts=attempts + 1)
+                if sub_answer:
+                    sub_answers.append(sub_answer)
+                else:
+                    sub_answers.append(f"Could not find an answer to sub-question: {sub_question_text}")
 
-        # After processing subquestions, attempt to generate an answer using the collected information
+        # After processing tasks and/or subquestions, attempt to generate an answer using the collected information
         combined_context = {
             'question': question_text,
             'tasks': task_outcomes,
@@ -338,8 +396,19 @@ class QuestionProcessor:
         }
         answer = self.answer_generator.generate_answer_from_context(combined_context)
         if answer:
-            database.update_question_status(self.conn, question_id, 'answered', answer)
-            return answer
+            # Validate if the answer indicates unanswerable
+            is_unanswerable = self.validate_answer(question_text, answer)
+            if is_unanswerable is None:
+                logger.error("Failed to validate answer. Marking question as unanswerable.")
+                database.update_question_status(self.conn, question_id, 'unanswerable')
+                return None
+            elif is_unanswerable:
+                logger.info("Answer indicates the question is unanswerable.")
+                database.update_question_status(self.conn, question_id, 'unanswerable')
+                return None
+            else:
+                database.update_question_status(self.conn, question_id, 'answered', answer)
+                return answer
         else:
             # Check for pending tasks or subquestions
             if not self.has_pending_tasks_or_subquestions(question_id):
@@ -349,24 +418,46 @@ class QuestionProcessor:
                 logger.debug("There are still pending tasks or subquestions.")
                 return None
 
-    def extract_keywords(self, question_text: str) -> Optional[List[str]]:
+    def validate_answer(self, question: str, answer: str) -> Optional[bool]:
+        """
+        Validates whether the generated answer indicates that the question is unanswerable.
+
+        Args:
+            question (str): The original question text.
+            answer (str): The generated answer text.
+
+        Returns:
+            Optional[bool]: True if the answer indicates unanswerable, False if answerable, None if validation failed.
+        """
+        validation_task = {
+            "name": "validate_answer",
+            "parameters": {"question": question, "answer": answer}
+        }
+        outcome = self.task_manager.process_task(validation_task, question_id=None, question_text=question)
+        if 'error' in outcome.get('outcome', {}):
+            logger.error(f"Error validating answer: {outcome['outcome']['error']}")
+            return None
+        is_unanswerable = outcome.get('outcome', {}).get('is_unanswerable', False)
+        return is_unanswerable
+    
+    def extract_keywords(self, question_id: int, question_text: str) -> Optional[List[str]]:
         keyword_task = {
             "name": "extract_keywords",
             "parameters": {"text": question_text}
         }
-        outcome = self.task_manager.process_task(keyword_task, question_id=-1, question_text=question_text)  # -1 indicates system tasks
+        outcome = self.task_manager.process_task(keyword_task, question_id=question_id, question_text=question_text)
         if 'error' in outcome.get('outcome', {}):
             logger.error(f"Error extracting keywords: {outcome['outcome']['error']}")
             return None
         keywords = outcome.get('outcome', {}).get('keywords', [])
         return keywords
 
-    def evaluate_question_focus(self, question_text: str) -> bool:
+    def evaluate_question_focus(self, question_id: int, question_text: str) -> bool:
         evaluate_task = {
             "name": "evaluate_question_focus",
             "parameters": {"question": question_text}
         }
-        outcome = self.task_manager.process_task(evaluate_task, question_id=-1, question_text=question_text)
+        outcome = self.task_manager.process_task(evaluate_task, question_id=question_id, question_text=question_text)
         if 'error' in outcome.get('outcome', {}):
             logger.error(f"Error evaluating question focus: {outcome['outcome']['error']}")
             return False
@@ -383,30 +474,17 @@ class QuestionProcessor:
             }
         ]
 
-    def generate_subquestions(self, question_text: str) -> List[str]:
-        logger.debug(f"Generating subquestions for question: {question_text}")
-        prompt = {
-            "subquestion_generation": {
-                "description": (
-                    "Please analyze the question below and decompose it into smaller, more specific sub-questions that can help in answering the main question comprehensively. "
-                    "Return ONLY valid JSON with one key: 'subquestions' (a list of strings). Ensure the JSON is enclosed within a code block labeled as json. Do not include any additional text or explanations."
-                    "\n\n**Example:**\n```json\n{\n  \"subquestions\": [\n    \"What are the recent advancements in AI hardware in October 2024?\",\n    \"What new AI software models were released in October 2024?\",\n    \"What significant open-source AI contributions were made in October 2024?\",\n    \"How do these advancements impact the AI industry overall?\"\n  ]\n}\n```"
-                ),
-                "parameters": {"question": question_text}
-            }
+    def generate_subquestions(self, question_id: int, question_text: str) -> List[str]:
+        subquestions_task = {
+            "name": "generate_subquestions",
+            "parameters": {"question": question_text}
         }
-        prompt_str = json.dumps(prompt)
-        try:
-            response = send_llm_request(prompt_str, self.cache, TASK_GENERATION_MODEL_NAME, OLLAMA_URL, expect_json=True)
-            sub_questions = response.get("subquestions", [])
-            if not sub_questions:
-                logger.error("Failed to generate sub-questions. The response was empty or improperly formatted.")
-            else:
-                logger.debug(f"Generated sub-questions: {sub_questions}")
-            return sub_questions
-        except Exception as e:
-            logger.exception(f"Error generating subquestions: {e}")
+        outcome = self.task_manager.process_task(subquestions_task, question_id=question_id, question_text=question_text)
+        if 'error' in outcome.get('outcome', {}):
+            logger.error(f"Error generating subquestions: {outcome['outcome']['error']}")
             return []
+        sub_questions = outcome.get('outcome', {}).get('subquestions', [])
+        return sub_questions
 
     def get_or_create_subquestion(self, sub_question_text: str, parent_id: int) -> int:
         cursor = self.conn.cursor()
@@ -444,7 +522,7 @@ def main():
     with load_cache(CACHE_FILE) as cache:
         try:
             # Define the main question
-            question_text = """**Objective**: Create an elaborate complete markdown report detailing advancements in artificial intelligence only in October 2024, covering hardware, software, open-source developments and emerging trends (focus multiple large companies have shown recently) from reputable and credible sources. Ensure the report highlights recent trends and innovations that reflect the latest industry shifts and focus areas. Each statement should include online references to credible sources. Structure the report to appeal to a broad audience, including both technical and strategic stakeholders. Each section should be engaging, visual, and supported by concrete data from authoritative sources, preferably the official announcements, technical documentation, or product pages of the service providers or manufacturers.
+            question_text = """**Objective**: Create an elaborate complete markdown report detailing advancements in artificial intelligence only in November 2024, covering hardware, software, open-source developments and emerging trends (focus multiple large companies have shown recently) from reputable and credible sources. Ensure the report highlights recent trends and innovations that reflect the latest industry shifts and focus areas. Each statement should include online references to credible sources. Structure the report to appeal to a broad audience, including both technical and strategic stakeholders. Each section should be engaging, visual, and supported by concrete data from authoritative sources, preferably the official announcements, technical documentation, or product pages of the service providers or manufacturers.
                 **AI Hardware Advancements**: 
                 - Present major updates in AI-specific hardware, focusing on recent breakthroughs and trends:
                     - Summarize upcoming releases or breakthroughs (e.g., new NVIDIA GPUs, Apple’s chips, advancements in edge AI hardware).
