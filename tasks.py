@@ -916,8 +916,8 @@ def evaluate_summary(task_params: Dict[str, Any], cache: Any = None) -> Dict[str
     description = (
         "Determine whether the following summary is valuable for inclusion in the context to help answer the given question. "
         "A valuable summary should provide clear insights that directly address the question. "
-        "An error message, a security warning, or a cookie policy is not valuable. "
-        "But news relevant to answering the question is."
+        "If the only information in the summary is an error message, a security warning, or a cookie policy, it is not valuable. "
+        "News relevant to answering the question is. When in doubt, consider it valuable."
     )
     expected_keys = ["is_valuable"]
     prompt = enforce_json_response(description, expected_keys) + f"\n\nQuestion:\n{question}\n\nSummary:\n{summary}"
