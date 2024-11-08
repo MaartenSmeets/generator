@@ -5,7 +5,7 @@ import os
 import logging
 import shelve
 import sqlite3
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import tasks  # Import the tasks module
 import database  # Import the new database module
 from llm_utils import send_llm_request
@@ -47,282 +47,123 @@ OLLAMA_URL = "http://localhost:11434/api/generate"  # Replace with your actual e
 TASK_GENERATION_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for task generation
 ANSWER_GENERATION_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for answer generation
 CACHE_FILE = os.path.join("output", 'cache.db')
+MAX_ATTEMPTS = 3
 
-# -------------------- Task and Sub-question Generation Functions --------------------
+# -------------------- Helper Functions --------------------
 
-def generate_tasks_and_subquestions(question_text: str, cache: Any) -> (str, List[Dict[str, Any]], List[str]):
-    """
-    Generate tasks and sub-questions based on the main question.
+def load_cache(cache_file: str):
+    return shelve.open(cache_file)
 
-    Args:
-        question_text (str): The main question text.
-        cache (Any): The cache object.
+# -------------------- Classes --------------------
 
-    Returns:
-        Tuple[str, List[Dict[str, Any]], List[str]]: A tuple containing the answer, list of tasks, and list of sub-questions.
-    """
-    task_list = tasks.list_tasks()
-    logger.debug(f"Generating tasks and subquestions for question: {question_text}")
-    prompt = {
-        "task_generation": {
-            "description": (
-                "Please analyze the question below and decompose it into smaller, more specific sub-questions that can help in answering the main question comprehensively. "
-                "For each sub-question, consider what tasks might be necessary to answer it, such as performing search queries, extracting content, summarizing information, etc. "
-                "Generate a list of tasks with appropriate parameters needed to answer the sub-questions and the main question. "
-                "Note that the 'search_query' task can accept an optional 'from_date' parameter (can only be 'past month' or 'past year') to limit search results to recent information. Use this parameter when it is important to get the latest data. "
-                "Return ONLY valid JSON with three keys: 'answer' (a string, can be empty), 'tasks' (a list of dictionaries with 'name' and 'parameters'), 'subquestions' (a list of strings). Ensure the JSON is enclosed within a code block labeled as json. Do not include any additional text or explanations."
-                "\n\n**Example:**\n```json\n{\n  \"answer\": \"\",\n  \"tasks\": [\n    {\"name\": \"search_query\", \"parameters\": {\"query\": \"AI hardware advancements October 2024\", \"from_date\": \"past month\"}},\n    {\"name\": \"extract_content\", \"parameters\": {\"url\": \"https://example.com/ai-hardware\", \"question\": \"...\"}}\n  ],\n  \"subquestions\": [\n    \"What are the recent advancements in AI hardware in October 2024?\",\n    \"...\"\n  ]\n}\n```"
-            ),
-            "parameters": {"question": question_text},
-            "task_list": task_list,
-        }
-    }
-    prompt_str = json.dumps(prompt)
-    response = send_llm_request(prompt_str, cache, TASK_GENERATION_MODEL_NAME, OLLAMA_URL, expect_json=True)
-    # Extract answer, tasks, and subquestions
-    answer = response.get("answer", "")
-    tasks_data = response.get("tasks", [])
-    sub_questions = response.get("subquestions", [])
-    
-    if not sub_questions:
-        logger.error("Failed to generate sub-questions. The response was empty or improperly formatted.")
-    else:
-        logger.debug(f"Generated sub-questions: {sub_questions}")
+class TaskManager:
+    def __init__(self, conn: sqlite3.Connection, cache: shelve.Shelf):
+        self.conn = conn
+        self.cache = cache
 
-    return answer, tasks_data, sub_questions
+    def process_task(self, task: Dict[str, Any], question_id: int, question_text: str) -> Dict[str, Any]:
+        task_name = task.get("name")
+        parameters = task.get("parameters", {})
+        logger.debug(f"Processing task '{task_name}' with parameters {parameters}")
 
-def generate_answer_from_context(context: Dict[str, Any], cache: Any) -> str:
-    """
-    Generate an answer based on the provided context.
+        # Add the question to the parameters if not already present
+        parameters.setdefault('question', question_text)
 
-    Args:
-        context (Dict[str, Any]): The context containing question, tasks, and sub-answers.
-        cache (Any): The cache object.
+        # Check if the task has already been performed with the same parameters
+        existing_outcome = database.get_existing_task_outcome(self.conn, task_name, parameters)
+        if existing_outcome is not None:
+            logger.info(f"Using existing outcome for task '{task_name}' with parameters {parameters}")
+            outcome = existing_outcome
+            # Update the task status to 'completed' if not already done
+            cursor = self.conn.cursor()
+            parameters_json = json.dumps(parameters, sort_keys=True)
+            cursor.execute('''
+                UPDATE Tasks SET status = ?, outcome = ? WHERE question_id = ? AND task_type = ? AND parameters = ?
+            ''', ('completed', json.dumps(outcome), question_id, task_name, parameters_json))
+            self.conn.commit()
+        else:
+            try:
+                # Delegate task execution to tasks.py
+                outcome = tasks.execute_task(task_name, parameters, self.cache)
+                # Insert the task with the outcome
+                task_id = database.insert_task(self.conn, question_id, task_name, parameters, status='completed', outcome=outcome)
+                database.update_task_status(self.conn, task_id, 'completed', outcome)
+            except Exception as e:
+                logger.exception(f"Error executing task '{task_name}' with parameters {parameters}: {e}")
+                outcome = {'error': str(e)}
+                # Insert the task with the error
+                task_id = database.insert_task(self.conn, question_id, task_name, parameters, status='failed', outcome=outcome)
+                database.update_task_status(self.conn, task_id, 'failed', outcome)
 
-    Returns:
-        str: The generated answer.
-    """
-    logger.debug("Generating answer from context.")
-    prompt = {
-        "answer_generation": {
-            "description": (
-                "Based on the provided context, which includes the question, tasks with their parameters and outcomes, and sub-answers, generate an answer to the question. "
-                "Ensure all sources are verified and include concrete URL references. "
-                "Return ONLY valid JSON with one key: 'answer' (a string). No additional text or explanations."
-            ),
-            "parameters": context
-        }
-    }
-    prompt_str = json.dumps(prompt)
+        # Handle task-specific logic
+        return self.handle_task_outcome(task_name, outcome, parameters, question_id, question_text)
 
-    # Enhanced Logging: Capture the raw response
-    try:
-        response = send_llm_request(prompt_str, cache, ANSWER_GENERATION_MODEL_NAME, OLLAMA_URL, expect_json=False)
-        logger.debug(f"Raw LLM response: {response}")
+    def handle_task_outcome(self, task_name: str, outcome: Dict[str, Any], parameters: Dict[str, Any], question_id: int, question_text: str) -> Dict[str, Any]:
+        sub_task_outcomes = []
 
-        # Attempt to extract JSON from the response
-        # Remove any code blocks or extra text that might interfere with JSON parsing
-        # For example, remove ```json\n and \n``` if present
-        json_start = response.find('{')
-        json_end = response.rfind('}') + 1
-        if json_start == -1 or json_end == -1:
-            logger.error("No JSON object found in the LLM response.")
-            return ""
+        if 'error' in outcome:
+            logger.error(f"Error in task '{task_name}': {outcome['error']}")
+            sub_task_outcomes.append({
+                'task_name': task_name,
+                'parameters': parameters,
+                'error': outcome['error']
+            })
+            return {
+                'task_name': task_name,
+                'parameters': parameters,
+                'outcome': outcome,
+                'sub_tasks': sub_task_outcomes
+            }
 
-        json_str = response[json_start:json_end]
-        logger.debug(f"Extracted JSON string: {json_str}")
-
-        # Parse the JSON string
-        parsed_response = json.loads(json_str)
-
-        # Extract the 'answer' field
-        answer = parsed_response.get("answer", "")
-        if not isinstance(answer, str):
-            logger.error("The 'answer' field is missing or not a string in the JSON response.")
-            return ""
-        logger.debug(f"Generated answer: {answer}")
-        return answer
-
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON decoding failed: {e}")
-        logger.error(f"LLM response was: {response}")
-        return ""
-    except Exception as e:
-        logger.exception(f"An unexpected error occurred while generating answer from context: {e}")
-        return ""
-
-def generate_initial_tasks(question_text: str, keywords: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-    """
-    Generate the initial set of tasks based on the main question and extracted keywords.
-
-    Args:
-        question_text (str): The main question text.
-        keywords (Optional[List[str]], optional): Extracted keywords from the question. Defaults to None.
-
-    Returns:
-        List[Dict[str, Any]]: A list of initial tasks to perform.
-    """
-    logger.debug(f"Generating initial tasks for question: {question_text}")
-    # The initial task is to perform a search query with the keywords as the query
-    if keywords:
-        query = ' '.join(keywords)
-    else:
-        query = question_text
-    tasks_to_perform = [
-        {
-            "name": "search_query",
-            "parameters": {"query": query}
-        }
-    ]
-    return tasks_to_perform
-
-def generate_subquestions(question_text: str, cache: Any) -> List[str]:
-    """
-    Generate sub-questions to further break down the main question.
-
-    Args:
-        question_text (str): The main question text.
-        cache (Any): The cache object.
-
-    Returns:
-        List[str]: A list of sub-questions.
-    """
-    logger.debug(f"Generating subquestions for question: {question_text}")
-    prompt = {
-        "subquestion_generation": {
-            "description": (
-                "Please analyze the question below and decompose it into smaller, more specific sub-questions that can help in answering the main question comprehensively. "
-                "Return ONLY valid JSON with one key: 'subquestions' (a list of strings). Ensure the JSON is enclosed within a code block labeled as json. Do not include any additional text or explanations."
-                "\n\n**Example:**\n```json\n{\n  \"subquestions\": [\n    \"What are the recent advancements in AI hardware in October 2024?\",\n    \"What new AI software models were released in October 2024?\",\n    \"What significant open-source AI contributions were made in October 2024?\",\n    \"How do these advancements impact the AI industry overall?\"\n  ]\n}\n```"
-            ),
-            "parameters": {"question": question_text}
-        }
-    }
-    prompt_str = json.dumps(prompt)
-    response = send_llm_request(prompt_str, cache, TASK_GENERATION_MODEL_NAME, OLLAMA_URL, expect_json=True)
-    sub_questions = response.get("subquestions", [])
-
-    if not sub_questions:
-        logger.error("Failed to generate sub-questions. The response was empty or improperly formatted.")
-    else:
-        logger.debug(f"Generated sub-questions: {sub_questions}")
-
-    return sub_questions
-
-# -------------------- Task Execution --------------------
-
-def process_task(task: Dict[str, Any], question_id: int, question_text: str, conn: sqlite3.Connection, cache: Any) -> Dict[str, Any]:
-    """
-    Process a single task:
-    - Check if the task outcome is cached.
-    - If not, execute the task using tasks.execute_task.
-    - Handle outcomes and potential sub-tasks.
-
-    Args:
-        task (Dict[str, Any]): The task dictionary containing 'name' and 'parameters'.
-        question_id (int): The ID of the associated question.
-        question_text (str): The text of the main question.
-        conn (sqlite3.Connection): The database connection object.
-        cache (Any): The cache object.
-
-    Returns:
-        Dict[str, Any]: The outcome of the task, including any sub-task outcomes.
-    """
-    task_name = task.get("name")
-    parameters = task.get("parameters", {})
-
-    logger.debug(f"Processing task '{task_name}' with parameters {parameters}")
-
-    # Add the question to the parameters if not already present
-    parameters.setdefault('question', question_text)
-
-    # Check if the task has already been performed with the same parameters
-    existing_outcome = database.get_existing_task_outcome(conn, task_name, parameters)
-    if existing_outcome is not None:
-        logger.info(f"Using existing outcome for task '{task_name}' with parameters {parameters}")
-        outcome = existing_outcome
-        # Update the task status to 'completed' if not already done
-        cursor = conn.cursor()
-        parameters_json = json.dumps(parameters, sort_keys=True)
-        cursor.execute('''
-            UPDATE Tasks SET status = ?, outcome = ? WHERE question_id = ? AND task_type = ? AND parameters = ?
-        ''', ('completed', json.dumps(outcome), question_id, task_name, parameters_json))
-        conn.commit()
-    else:
-        try:
-            # Delegate task execution to tasks.py
-            outcome = tasks.execute_task(task_name, parameters, cache)
-            # Insert the task with the outcome
-            task_id = database.insert_task(conn, question_id, task_name, parameters, status='completed', outcome=outcome)
-            database.update_task_status(conn, task_id, 'completed', outcome)
-        except Exception as e:
-            logger.exception(f"Error executing task '{task_name}' with parameters {parameters}: {e}")
-            outcome = {'error': str(e)}
-            # Insert the task with the error
-            task_id = database.insert_task(conn, question_id, task_name, parameters, status='failed', outcome=outcome)
-            database.update_task_status(conn, task_id, 'failed', outcome)
-
-    # Now, depending on the task and outcome, generate further tasks
-    sub_task_outcomes = []
-
-    if 'error' in outcome:
-        logger.error(f"Error in task '{task_name}': {outcome['error']}")
-        # Decide how to handle the error
-        sub_task_outcomes.append({
-            'task_name': task_name,
-            'parameters': parameters,
-            'error': outcome['error']
-        })
-    else:
         if task_name == 'search_query':
-            # For each search result, create 'extract_content' and 'summarize_text' tasks
             search_results = outcome.get('search_results', [])
             for result in search_results:
                 url = result.get('url')
                 if not url:
                     logger.warning("Search result missing 'url' field.")
                     continue
-                sub_task = {
+                # Extract Content Task
+                extract_task = {
                     'name': 'extract_content',
                     'parameters': {'url': url, 'question': question_text}
                 }
-                sub_outcome = process_task(sub_task, question_id, question_text, conn, cache)
-                if 'error' in sub_outcome.get('outcome', {}):
-                    logger.error(f"Error in sub-task 'extract_content': {sub_outcome['outcome']['error']}")
+                extract_outcome = self.process_task(extract_task, question_id, question_text)
+                if 'error' in extract_outcome.get('outcome', {}):
+                    logger.error(f"Error in 'extract_content' task: {extract_outcome['outcome']['error']}")
                     sub_task_outcomes.append({
                         'url': url,
-                        'error': sub_outcome['outcome']['error']
+                        'error': extract_outcome['outcome']['error']
                     })
                     continue
-                structured_data = sub_outcome.get('outcome', {}).get('structured_data')
+                structured_data = extract_outcome.get('outcome', {}).get('structured_data')
                 if structured_data:
+                    # Summarize Text Task
                     summarize_task = {
                         'name': 'summarize_text',
                         'parameters': {'text': structured_data, 'question': question_text}
                     }
-                    summary_outcome = process_task(summarize_task, question_id, question_text, conn, cache)
+                    summary_outcome = self.process_task(summarize_task, question_id, question_text)
                     if 'error' in summary_outcome.get('outcome', {}):
-                        logger.error(f"Error in sub-task 'summarize_text': {summary_outcome['outcome']['error']}")
+                        logger.error(f"Error in 'summarize_text' task: {summary_outcome['outcome']['error']}")
                         sub_task_outcomes.append({
                             'url': url,
                             'error': summary_outcome['outcome']['error']
                         })
                         continue
                     summary = summary_outcome.get('outcome', {}).get('summary')
-                    # Evaluate the summary for value
-                    evaluation_task = {
+                    # Evaluate Summary Task
+                    evaluate_task = {
                         'name': 'evaluate_summary',
                         'parameters': {'summary': summary, 'question': question_text}
                     }
-                    evaluation_outcome = process_task(evaluation_task, question_id, question_text, conn, cache)
+                    evaluation_outcome = self.process_task(evaluate_task, question_id, question_text)
                     if 'error' in evaluation_outcome.get('outcome', {}):
-                        logger.error(f"Error in sub-task 'evaluate_summary': {evaluation_outcome['outcome']['error']}")
-                        # When in doubt, consider the information valuable
-                        is_valuable = True
+                        logger.error(f"Error in 'evaluate_summary' task: {evaluation_outcome['outcome']['error']}")
+                        is_valuable = True  # Default to valuable if unsure
                     else:
                         is_valuable = evaluation_outcome.get('outcome', {}).get('is_valuable', True)
                         if is_valuable is None:
-                            is_valuable = True  # Default to valuable if unsure
+                            is_valuable = True
                     if is_valuable:
                         sub_task_outcomes.append({
                             'url': url,
@@ -341,203 +182,266 @@ def process_task(task: Dict[str, Any], question_id: int, question_text: str, con
                         'url': url,
                         'error': 'No structured data extracted'
                     })
-        elif task_name == 'validate_fact':
-            if 'error' in outcome:
-                logger.error(f"Error in task '{task_name}': {outcome['error']}")
-                sub_task_outcomes.append({
-                    "task_name": task_name,
-                    "statement": parameters.get("statement"),
-                    "error": outcome['error']
-                })
-            else:
-                is_true = outcome.get("is_true", False)
-                confidence = outcome.get("confidence", 0.0)
-                sources = outcome.get("sources", [])
 
-                sub_task_outcomes.append({
-                    "task_name": task_name,
-                    "statement": parameters.get("statement"),
-                    "is_true": is_true,
-                    "confidence": confidence,
-                    "sources": sources
-                })
-        elif task_name == 'evaluate_summary':
-            # This task is specifically for evaluating the value of a summary
-            is_valuable = outcome.get("is_valuable", True)
+        elif task_name in ['validate_fact', 'is_reputable_source', 'evaluate_summary']:
+            # Handle other task-specific outcomes if necessary
             sub_task_outcomes.append({
-                "task_name": task_name,
-                "is_valuable": is_valuable
+                'task_name': task_name,
+                'outcome': outcome
             })
+
         # Add more task-specific handling as needed
 
-    # Return the final outcome, possibly including sub_task_outcomes
-    return {
-        'task_name': task_name,
-        'parameters': parameters,
-        'outcome': outcome,
-        'sub_tasks': sub_task_outcomes
-    }
+        return {
+            'task_name': task_name,
+            'parameters': parameters,
+            'outcome': outcome,
+            'sub_tasks': sub_task_outcomes
+        }
 
-# -------------------- Recursive Question Processing --------------------
+class AnswerGenerator:
+    def __init__(self, cache: shelve.Shelf):
+        self.cache = cache
 
-def process_question(question_id: int, conn: sqlite3.Connection, cache: Any, attempts: int = 0, max_attempts: int = 3) -> Optional[str]:
-    """
-    Recursively process a question by executing tasks and handling sub-questions.
+    def generate_answer_from_context(self, context: Dict[str, Any]) -> str:
+        logger.debug("Generating answer from context.")
+        prompt = {
+            "answer_generation": {
+                "description": (
+                    "Based on the provided context, which includes the question, tasks with their parameters and outcomes, and sub-answers, generate an answer to the question. "
+                    "Ensure all sources are verified and include concrete URL references. "
+                    "Return ONLY valid JSON with one key: 'answer' (a string). No additional text or explanations."
+                ),
+                "parameters": context
+            }
+        }
+        prompt_str = json.dumps(prompt)
 
-    Args:
-        question_id (int): The ID of the question to process.
-        conn (sqlite3.Connection): The database connection object.
-        cache (Any): The cache object.
-        attempts (int, optional): Current attempt count. Defaults to 0.
-        max_attempts (int, optional): Maximum allowed attempts. Defaults to 3.
+        try:
+            response = send_llm_request(prompt_str, self.cache, ANSWER_GENERATION_MODEL_NAME, OLLAMA_URL, expect_json=False)
+            logger.debug(f"Raw LLM response: {response}")
 
-    Returns:
-        Optional[str]: The answer to the question if found, else None.
-    """
-    cursor = conn.cursor()
-    cursor.execute('SELECT text, status, answer FROM Questions WHERE id = ?', (question_id,))
-    question_row = cursor.fetchone()
-    if not question_row:
-        logger.error(f"Question ID {question_id} not found.")
-        return None
-    question_text, status, existing_answer = question_row
+            # Extract JSON from response
+            json_start = response.find('{')
+            json_end = response.rfind('}') + 1
+            if json_start == -1 or json_end == -1:
+                logger.error("No JSON object found in the LLM response.")
+                return ""
 
-    logger.debug(f"Processing question ID {question_id}, status: {status}")
+            json_str = response[json_start:json_end]
+            logger.debug(f"Extracted JSON string: {json_str}")
 
-    # If the question is already answered, return the answer
-    if status == 'answered' and existing_answer:
-        logger.info(f"Question ID {question_id} is already answered.")
-        return existing_answer
+            # Parse JSON
+            parsed_response = json.loads(json_str)
+            answer = parsed_response.get("answer", "")
+            if not isinstance(answer, str):
+                logger.error("The 'answer' field is missing or not a string in the JSON response.")
+                return ""
+            logger.debug(f"Generated answer: {answer}")
+            return answer
 
-    # If we have exceeded max attempts, stop processing
-    if attempts >= max_attempts:
-        logger.warning(f"Max attempts reached for question ID {question_id}.")
-        database.update_question_status(conn, question_id, 'unanswerable')
-        return None
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decoding failed: {e}")
+            logger.error(f"LLM response was: {response}")
+            return ""
+        except Exception as e:
+            logger.exception(f"An unexpected error occurred while generating answer from context: {e}")
+            return ""
 
-    # Initialize task outcomes and sub_answers
-    task_outcomes = []
-    sub_answers = []
+class QuestionProcessor:
+    def __init__(self, conn: sqlite3.Connection, cache: shelve.Shelf):
+        self.conn = conn
+        self.cache = cache
+        self.task_manager = TaskManager(conn, cache)
+        self.answer_generator = AnswerGenerator(cache)
 
-    # Step 1: Extract keywords from the question
-    keyword_task = {
-        "name": "extract_keywords",
-        "parameters": {"text": question_text}
-    }
-    keyword_outcome = process_task(keyword_task, question_id, question_text, conn, cache)
-    if 'error' in keyword_outcome.get('outcome', {}):
-        logger.error(f"Error extracting keywords: {keyword_outcome['outcome']['error']}")
-        database.update_question_status(conn, question_id, 'unanswerable')
-        return None
-    keywords = keyword_outcome.get('outcome', {}).get('keywords', [])
-    logger.debug(f"Extracted keywords: {keywords}")
+    def process_question(self, question_id: int, attempts: int = 0) -> Optional[str]:
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT text, status, answer FROM Questions WHERE id = ?', (question_id,))
+        question_row = cursor.fetchone()
+        if not question_row:
+            logger.error(f"Question ID {question_id} not found.")
+            return None
+        question_text, status, existing_answer = question_row
 
-    # Step 2: Evaluate if the question is focused
-    evaluate_task = {
-        "name": "evaluate_question_focus",
-        "parameters": {"question": question_text}
-    }
-    evaluate_outcome = process_task(evaluate_task, question_id, question_text, conn, cache)
-    if 'error' in evaluate_outcome.get('outcome', {}):
-        logger.error(f"Error evaluating question focus: {evaluate_outcome['outcome']['error']}")
-        database.update_question_status(conn, question_id, 'unanswerable')
-        return None
-    is_focused = evaluate_outcome.get('outcome', {}).get('is_focused', False)
-    logger.debug(f"Is the question focused? {is_focused}")
+        logger.debug(f"Processing question ID {question_id}, status: {status}")
 
-    if is_focused:
-        # Proceed with generating initial tasks based on keywords
-        tasks_to_perform = generate_initial_tasks(question_text, keywords=keywords)
-        logger.debug(f"Generated initial tasks based on keywords: {tasks_to_perform}")
+        # If the question is already answered, return the answer
+        if status == 'answered' and existing_answer:
+            logger.info(f"Question ID {question_id} is already answered.")
+            return existing_answer
 
-        # Process tasks recursively
-        for task in tasks_to_perform:
-            try:
-                outcome = process_task(task, question_id, question_text, conn, cache)
+        # If we have exceeded max attempts, stop processing
+        if attempts >= MAX_ATTEMPTS:
+            logger.warning(f"Max attempts reached for question ID {question_id}.")
+            database.update_question_status(self.conn, question_id, 'unanswerable')
+            return None
+
+        # Step 1: Extract keywords from the question
+        keywords = self.extract_keywords(question_text)
+        if keywords is None:
+            logger.error("Failed to extract keywords.")
+            database.update_question_status(self.conn, question_id, 'unanswerable')
+            return None
+        logger.debug(f"Extracted keywords: {keywords}")
+
+        # Step 2: Evaluate if the question is focused
+        is_focused = self.evaluate_question_focus(question_text)
+        logger.debug(f"Is the question focused? {is_focused}")
+
+        task_outcomes = []
+        sub_answers = []
+
+        if is_focused:
+            # Generate initial tasks based on keywords
+            tasks_to_perform = self.generate_initial_tasks(question_text, keywords)
+            logger.debug(f"Generated initial tasks based on keywords: {tasks_to_perform}")
+
+            # Process each task
+            for task in tasks_to_perform:
+                outcome = self.task_manager.process_task(task, question_id, question_text)
                 task_outcomes.append(outcome)
-            except Exception as e:
-                logger.exception(f"Error processing task {task}: {e}")
-                task_outcomes.append({
-                    'task_name': task.get('name'),
-                    'parameters': task.get('parameters'),
-                    'error': str(e)
-                })
 
-        # Attempt to generate an answer from the context
+            # Attempt to generate an answer from the context
+            combined_context = {
+                'question': question_text,
+                'tasks': task_outcomes,
+                'sub_answers': sub_answers
+            }
+            answer = self.answer_generator.generate_answer_from_context(combined_context)
+            if answer:
+                database.update_question_status(self.conn, question_id, 'answered', answer)
+                return answer
+
+            logger.debug("Unable to generate answer from initial tasks, generating subquestions.")
+        else:
+            logger.debug("Question is not focused. Generating subquestions.")
+
+        # Generate subquestions
+        sub_questions = self.generate_subquestions(question_text)
+        logger.debug(f"Generated sub-questions: {sub_questions}")
+
+        # Process sub-questions
+        for sub_question_text in sub_questions:
+            sub_question_id = self.get_or_create_subquestion(sub_question_text, question_id)
+            sub_answer = self.process_question(sub_question_id, attempts=attempts + 1)
+            if sub_answer:
+                sub_answers.append(sub_answer)
+            else:
+                sub_answers.append(f"Could not find an answer to sub-question: {sub_question_text}")
+
+        # After processing subquestions, attempt to generate an answer using the collected information
         combined_context = {
             'question': question_text,
             'tasks': task_outcomes,
-            'sub_answers': sub_answers  # Empty at this point
+            'sub_answers': sub_answers
         }
-        answer = generate_answer_from_context(combined_context, cache)
+        answer = self.answer_generator.generate_answer_from_context(combined_context)
         if answer:
-            database.update_question_status(conn, question_id, 'answered', answer)
+            database.update_question_status(self.conn, question_id, 'answered', answer)
             return answer
+        else:
+            # Check for pending tasks or subquestions
+            if not self.has_pending_tasks_or_subquestions(question_id):
+                logger.debug("No more pending tasks or subquestions, retrying.")
+                return self.process_question(question_id, attempts=attempts + 1)
+            else:
+                logger.debug("There are still pending tasks or subquestions.")
+                return None
 
-        # If unable to generate answer, generate subquestions
-        logger.debug("Unable to generate answer from initial tasks, generating subquestions.")
+    def extract_keywords(self, question_text: str) -> Optional[List[str]]:
+        keyword_task = {
+            "name": "extract_keywords",
+            "parameters": {"text": question_text}
+        }
+        outcome = self.task_manager.process_task(keyword_task, question_id=-1, question_text=question_text)  # -1 indicates system tasks
+        if 'error' in outcome.get('outcome', {}):
+            logger.error(f"Error extracting keywords: {outcome['outcome']['error']}")
+            return None
+        keywords = outcome.get('outcome', {}).get('keywords', [])
+        return keywords
 
-    else:
-        # If question is not focused, generate subquestions first
-        logger.debug("Question is not focused. Generating subquestions.")
+    def evaluate_question_focus(self, question_text: str) -> bool:
+        evaluate_task = {
+            "name": "evaluate_question_focus",
+            "parameters": {"question": question_text}
+        }
+        outcome = self.task_manager.process_task(evaluate_task, question_id=-1, question_text=question_text)
+        if 'error' in outcome.get('outcome', {}):
+            logger.error(f"Error evaluating question focus: {outcome['outcome']['error']}")
+            return False
+        is_focused = outcome.get('outcome', {}).get('is_focused', False)
+        return is_focused
 
-    # Generate subquestions regardless of focus
-    sub_questions = generate_subquestions(question_text, cache)
-    logger.debug(f"Generated sub-questions: {sub_questions}")
+    def generate_initial_tasks(self, question_text: str, keywords: List[str]) -> List[Dict[str, Any]]:
+        logger.debug(f"Generating initial tasks for question: {question_text}")
+        query = ' '.join(keywords) if keywords else question_text
+        return [
+            {
+                "name": "search_query",
+                "parameters": {"query": query}
+            }
+        ]
 
-    # Process sub-questions
-    for sub_question_text in sub_questions:
-        # Check if sub-question already exists to avoid duplicates
-        cursor.execute('SELECT id, status, answer FROM Questions WHERE text = ? AND parent_id = ?', (sub_question_text, question_id))
+    def generate_subquestions(self, question_text: str) -> List[str]:
+        logger.debug(f"Generating subquestions for question: {question_text}")
+        prompt = {
+            "subquestion_generation": {
+                "description": (
+                    "Please analyze the question below and decompose it into smaller, more specific sub-questions that can help in answering the main question comprehensively. "
+                    "Return ONLY valid JSON with one key: 'subquestions' (a list of strings). Ensure the JSON is enclosed within a code block labeled as json. Do not include any additional text or explanations."
+                    "\n\n**Example:**\n```json\n{\n  \"subquestions\": [\n    \"What are the recent advancements in AI hardware in October 2024?\",\n    \"What new AI software models were released in October 2024?\",\n    \"What significant open-source AI contributions were made in October 2024?\",\n    \"How do these advancements impact the AI industry overall?\"\n  ]\n}\n```"
+                ),
+                "parameters": {"question": question_text}
+            }
+        }
+        prompt_str = json.dumps(prompt)
+        try:
+            response = send_llm_request(prompt_str, self.cache, TASK_GENERATION_MODEL_NAME, OLLAMA_URL, expect_json=True)
+            sub_questions = response.get("subquestions", [])
+            if not sub_questions:
+                logger.error("Failed to generate sub-questions. The response was empty or improperly formatted.")
+            else:
+                logger.debug(f"Generated sub-questions: {sub_questions}")
+            return sub_questions
+        except Exception as e:
+            logger.exception(f"Error generating subquestions: {e}")
+            return []
+
+    def get_or_create_subquestion(self, sub_question_text: str, parent_id: int) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT id, status, answer FROM Questions WHERE text = ? AND parent_id = ?', (sub_question_text, parent_id))
         result = cursor.fetchone()
         if result:
             sub_question_id, sub_status, sub_answer = result
             if sub_status == 'answered' and sub_answer:
-                sub_answers.append(sub_answer)
-                continue
+                logger.info(f"Sub-question already answered: {sub_question_text}")
+                return sub_question_id
+            else:
+                return sub_question_id
         else:
-            sub_question_id = database.insert_question(conn, sub_question_text, parent_id=question_id)
-        sub_answer = process_question(sub_question_id, conn, cache, attempts=attempts+1, max_attempts=max_attempts)
-        if sub_answer:
-            sub_answers.append(sub_answer)
-        else:
-            sub_answers.append(f"Could not find an answer to sub-question: {sub_question_text}")
+            sub_question_id = database.insert_question(self.conn, sub_question_text, parent_id=parent_id)
+            logger.debug(f"Inserted new sub-question with ID {sub_question_id}: {sub_question_text}")
+            return sub_question_id
 
-    # After processing subquestions, attempt to generate an answer using the collected information
-    combined_context = {
-        'question': question_text,
-        'tasks': task_outcomes,
-        'sub_answers': sub_answers
-    }
-    answer = generate_answer_from_context(combined_context, cache)
-    if answer:
-        database.update_question_status(conn, question_id, 'answered', answer)
-        return answer
-    else:
-        # Check if there are any pending tasks or subquestions
+    def has_pending_tasks_or_subquestions(self, question_id: int) -> bool:
+        cursor = self.conn.cursor()
         cursor.execute('SELECT COUNT(*) FROM Tasks WHERE question_id = ? AND status = ?', (question_id, 'pending'))
         pending_tasks_count = cursor.fetchone()[0]
 
         cursor.execute('SELECT COUNT(*) FROM Questions WHERE parent_id = ? AND status != ?', (question_id, 'answered'))
         pending_subquestions_count = cursor.fetchone()[0]
 
-        if pending_tasks_count == 0 and pending_subquestions_count == 0:
-            logger.debug("No more pending tasks or subquestions, attempting to generate more.")
-            # Recurse with increased attempts
-            return process_question(question_id, conn, cache, attempts=attempts+1, max_attempts=max_attempts)
-        else:
-            logger.debug("There are still pending tasks or subquestions.")
-            # Return None to indicate that processing is ongoing
-            return None
+        return pending_tasks_count > 0 or pending_subquestions_count > 0
 
 # -------------------- Main Execution Flow --------------------
 
-if __name__ == '__main__':
+def main():
     # Initialize the database
     conn = database.init_db()
 
     # Open a persistent cache with shelve
-    with shelve.open(CACHE_FILE) as cache:
+    with load_cache(CACHE_FILE) as cache:
         try:
             # Define the main question
             question_text = """**Objective**: Create an elaborate complete markdown report detailing advancements in artificial intelligence only in October 2024, covering hardware, software, open-source developments and emerging trends (focus multiple large companies have shown recently) from reputable and credible sources. Ensure the report highlights recent trends and innovations that reflect the latest industry shifts and focus areas. Each statement should include online references to credible sources. Structure the report to appeal to a broad audience, including both technical and strategic stakeholders. Each section should be engaging, visual, and supported by concrete data from authoritative sources, preferably the official announcements, technical documentation, or product pages of the service providers or manufacturers.
@@ -563,8 +467,11 @@ if __name__ == '__main__':
             # Insert the main question into the database
             main_question_id = database.insert_question(conn, question_text)
 
+            # Initialize the question processor
+            processor = QuestionProcessor(conn, cache)
+
             # Process the main question
-            main_answer = process_question(main_question_id, conn, cache)
+            main_answer = processor.process_question(main_question_id)
 
             if main_answer:
                 print(f"Answer to the main question: {main_answer}")
@@ -578,3 +485,6 @@ if __name__ == '__main__':
         finally:
             conn.close()
             logger.debug("Database connection closed.")
+
+if __name__ == '__main__':
+    main()
