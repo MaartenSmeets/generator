@@ -279,6 +279,9 @@ def process_task(task: Dict[str, Any], question_id: int, question_text: str, con
             search_results = outcome.get('search_results', [])
             for result in search_results:
                 url = result.get('url')
+                if not url:
+                    logger.warning("Search result missing 'url' field.")
+                    continue
                 sub_task = {
                     'name': 'extract_content',
                     'parameters': {'url': url, 'question': question_text}

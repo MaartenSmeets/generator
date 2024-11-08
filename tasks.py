@@ -1,44 +1,43 @@
 # tasks.py
 
-from typing import List, Dict, Any, Callable
-import requests
+from typing import List, Dict, Any, Callable, Optional, Tuple
+import json
+import logging
 import os
 import io
-import json
+import re
+import subprocess
+import time
+import hashlib
+from urllib.parse import urlparse
+import selenium
+import requests
 from bs4 import BeautifulSoup
+from lxml import html, etree
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
-import spacy
-import pytesseract
-from PIL import Image
-from translate import Translator
 from rake_nltk import Rake
-import subprocess
-from llm_utils import send_llm_request
-import logging
-from huggingface_hub import hf_hub_download
+import spacy
+from PIL import Image
+import pytesseract
+from translate import Translator
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 import undetected_chromedriver as uc
-import time
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
+
+from llm_utils import send_llm_request
 from utils import (
     get_som_labeled_img,
     check_ocr_box,
     get_caption_model_processor,
     get_yolo_model,
 )
-from urllib.parse import urlparse
-import re
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-import random
-import selenium
-from lxml import html, etree
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
-from typing import List, Dict, Any, Callable, Optional, Tuple
 
 # -------------------- Logging Configuration --------------------
 
@@ -70,7 +69,7 @@ if not logger.handlers:
 # -------------------- Initialization of Models and Resources --------------------
 
 device = 'cpu'  # Adjust as necessary
-logger.debug("Loading SOM model.")
+logger.debug("Loading YOLO model.")
 som_model = get_yolo_model(model_path='weights/icon_detect/best.pt')
 som_model.to(device)
 logger.debug("Loading caption model processor.")
@@ -83,8 +82,7 @@ caption_model_processor = get_caption_model_processor(
 # Define the resources and their specific paths
 nltk_resources = {
     "stopwords": "corpora/stopwords",
-    "punkt": "tokenizers/punkt",
-    "vader_lexicon": "sentiment/vader_lexicon"
+    "punkt": "tokenizers/punkt"
 }
 
 # Download NLTK resources automatically if they are missing
@@ -121,11 +119,8 @@ EVALUATE_SUMMARY_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable mod
 
 # -------------------- Task Definitions --------------------
 
-# Define a dictionary to map task names to functions
-TASK_FUNCTIONS: Dict[str, Callable[[Dict[str, Any], Any], Dict[str, Any]]] = {}
-
 def list_tasks() -> List[Dict[str, Any]]:
-    """Return a list of available tasks with descriptions, parameters, and outcomes."""
+    """Return a list of available public tasks with descriptions, parameters, and outcomes."""
     return [
         {
             "name": "search_query",
@@ -140,13 +135,19 @@ def list_tasks() -> List[Dict[str, Any]]:
             "name": "extract_content",
             "description": "Extract relevant content from a webpage.",
             "parameters": ["url", "question"],
-            "outcomes": ["structured_data"]
+            "outcomes": ["extracted_text", "method_used", "score"]
         },
         {
             "name": "validate_fact",
             "description": "Validate the truthfulness of a statement using fact-checking.",
             "parameters": ["statement"],
             "outcomes": ["is_true", "confidence", "sources"]
+        },
+        {
+            "name": "is_reputable_source",
+            "description": "Determine if a URL is from a reputable source using LLM.",
+            "parameters": ["url"],
+            "outcomes": ["is_reputable"]
         },
         {
             "name": "summarize_text",
@@ -197,18 +198,6 @@ def list_tasks() -> List[Dict[str, Any]]:
             "outcomes": ["keywords"]
         },
         {
-            "name": "is_reputable_source",
-            "description": "Determine if a URL is from a reputable source using LLM.",
-            "parameters": ["url"],
-            "outcomes": ["is_reputable"]
-        },
-        {
-            "name": "is_content_valuable",
-            "description": "Check if the extracted content is valuable for answering a question.",
-            "parameters": ["extracted_text", "question"],
-            "outcomes": ["is_valuable"]
-        },
-        {
             "name": "evaluate_question_focus",
             "description": "Evaluate whether a question is focused and detailed on a single topic.",
             "parameters": ["question"],
@@ -222,7 +211,10 @@ def list_tasks() -> List[Dict[str, Any]]:
         }
     ]
 
-# -------------------- Task Function Implementations --------------------
+# Define a dictionary to map **public** task names to functions
+TASK_FUNCTIONS_PUBLIC: Dict[str, Callable[[Dict[str, Any], Any], Dict[str, Any]]] = {}
+
+# -------------------- Public Task Function Implementations --------------------
 
 def search_query(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     query = task_params.get('query')
@@ -275,112 +267,6 @@ def search_query(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, An
         logger.exception("An unexpected error occurred during search query.")
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
-TASK_FUNCTIONS["search_query"] = search_query
-
-def fetch_youtube_transcript(url: str) -> Dict[str, Any]:
-    """
-    Fetch the transcript of a YouTube video given its URL.
-
-    Args:
-        url (str): The YouTube video URL.
-
-    Returns:
-        Dict[str, Any]: A dictionary containing the transcript text or an error message.
-    """
-    logger.debug(f"Fetching YouTube transcript for URL: {url}")
-    try:
-        # Extract the video ID from the URL
-        parsed_url = urlparse(url)
-        if 'youtube.com' in parsed_url.netloc:
-            query_params = dict([part.split('=') for part in parsed_url.query.split('&') if '=' in part])
-            video_id = query_params.get('v')
-        elif 'youtu.be' in parsed_url.netloc:
-            video_id = parsed_url.path.lstrip('/')
-        else:
-            logger.error("Invalid YouTube URL format.")
-            return {"error": "Invalid YouTube URL format."}
-        
-        if not video_id:
-            logger.error("Video ID not found in the URL.")
-            return {"error": "Video ID not found in the URL."}
-        
-        # Fetch the transcript using YouTubeTranscriptApi
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-        transcript_text = " ".join([entry['text'] for entry in transcript_list])
-        logger.debug("Transcript fetched successfully.")
-        return {"transcript": transcript_text}
-    except VideoUnavailable:
-        logger.error("The video is unavailable.")
-        return {"error": "The video is unavailable."}
-    except TranscriptsDisabled:
-        logger.error("Transcripts are disabled for this video.")
-        return {"error": "Transcripts are disabled for this video."}
-    except NoTranscriptFound:
-        logger.error("No transcript found for this video.")
-        return {"error": "No transcript found for this video."}
-    except Exception as e:
-        logger.exception("An unexpected error occurred while fetching the transcript.")
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-def extract_page_source_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
-    """
-    Extract text content from the page source of a URL.
-
-    Args:
-        task_params (Dict[str, Any]): Parameters containing 'url'.
-        cache (Any): Optional cache parameter.
-
-    Returns:
-        Dict[str, Any]: Extracted text or error information.
-    """
-    url = task_params.get('url')
-    logger.debug(f"Fetching page source content from URL: {url}")
-    if not url:
-        logger.error("No URL provided for page source extraction.")
-        return {"error": "No URL provided for page source extraction."}
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        logger.debug("Page fetched successfully via requests.")
-        cleaned_html = clean_html_content(response.content)
-        text_content = extract_text_from_html(cleaned_html)
-        text_content = cleanup_extracted_text(text_content)
-        logger.debug(f"Extracted text length: {len(text_content)}")
-        return {"extracted_text": text_content}
-    except requests.RequestException as e:
-        logger.exception(f"Failed to fetch URL via requests: {url}")
-        return {"error": f"Failed to fetch URL via requests: {str(e)}"}
-    except Exception as e:
-        logger.exception(f"An unexpected error occurred during page source extraction: {e}")
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-# Register the function in TASK_FUNCTIONS if not already present
-TASK_FUNCTIONS["extract_page_source_content"] = extract_page_source_content
-
-def extract_text_with_pytesseract(screenshot_bytes: bytes) -> Optional[str]:
-    """
-    Use pytesseract to extract text from screenshot bytes.
-
-    Args:
-        screenshot_bytes (bytes): The screenshot image in bytes.
-
-    Returns:
-        Optional[str]: The extracted text or None if extraction fails.
-    """
-    try:
-        logger.debug("Method 3: Starting pytesseract OCR on screenshot.")
-        image = Image.open(io.BytesIO(screenshot_bytes))
-        extracted_text = pytesseract.image_to_string(image)
-        logger.debug("Method 3: Pytesseract OCR completed successfully.")
-        return extracted_text.strip()
-    except Exception as e:
-        logger.exception(f"Method 3: Pytesseract OCR failed: {e}")
-        return None
-
-# Register the new function in TASK_FUNCTIONS
-TASK_FUNCTIONS["extract_text_with_pytesseract"] = extract_text_with_pytesseract
-
 def extract_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     """
     Extract relevant content from a webpage using multiple methods and select the most valuable output based on text length.
@@ -409,6 +295,11 @@ def extract_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
     parsed_url = urlparse(url)
     domain = parsed_url.netloc.replace('.', '_')  # Replace dots to avoid issues in filenames
 
+    # Define the output directory for images and extracted texts
+    images_dir = os.path.join(output_dir, 'images')
+    os.makedirs(images_dir, exist_ok=True)
+    logger.debug(f"Images and extracted texts directory: {images_dir}")
+
     # Check if the URL is a YouTube link
     is_youtube = False
     if 'youtube.com' in parsed_url.netloc or 'youtu.be' in parsed_url.netloc:
@@ -420,12 +311,12 @@ def extract_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
     try:
         if is_youtube:
             logger.debug("Detected YouTube URL. Attempting to fetch transcript.")
-            transcript_result = fetch_youtube_transcript(url)
+            transcript_result = _fetch_youtube_transcript(url)
             if 'transcript' in transcript_result:
                 method_name = 'Method_YouTube_Transcript'
                 extracted_texts[method_name] = transcript_result['transcript']
                 logger.debug("Transcript obtained successfully.")
-                
+
                 # Write the extracted transcript to a text file
                 filename = f"{domain}_{url_hash}_{method_name}.txt"
                 filename = re.sub(r'\W+', '_', filename)  # Sanitize filename
@@ -436,148 +327,145 @@ def extract_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
             else:
                 logger.error(f"Failed to fetch transcript: {transcript_result.get('error')}")
         else:
-            # Method 0: Capture screenshot and grab page source
-            screenshot, page_source = capture_screenshot(url)
-            if not screenshot and not page_source:
-                logger.error("Failed to capture screenshot and page source.")
-                return {'error': "Failed to capture screenshot and page source."}
-            logger.debug("Captured screenshot and page source.")
-
-            # Method 1: Clean and analyze the source directly
-            try:
-                cleaned_html = clean_html_content(page_source.encode('utf-8') if isinstance(page_source, str) else page_source)
-                text_content = extract_text_from_html(cleaned_html)
-                cleaned_text = cleanup_extracted_text(text_content)
-                method_name = 'Method_1_Clean_Source'
-                extracted_texts[method_name] = cleaned_text
-                logger.debug("Method 1: Cleaned and analyzed the source directly.")
-                
-                # Write the extracted text to a text file
-                filename = f"{domain}_{url_hash}_{method_name}.txt"
-                filename = re.sub(r'\W+', '_', filename)  # Sanitize filename
-                file_path = os.path.join(images_dir, filename)
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(cleaned_text)
-                logger.debug(f"Extracted text from Method 1 written to {file_path}")
-            except Exception as e:
-                logger.exception(f"Method 1 failed: {e}")
-                extracted_texts['Method_1_Clean_Source'] = None
-
-            # Method 2: Use check_ocr_box/get_som_labeled_img on the screenshot
-            try:
-                # Generate a unique filename using a hash of the URL
-                filename = f"{domain}_{url_hash}_Method_2_Check_OCR_Box.png"
-                logger.debug(f"Generated filename for image: {filename}")
-
-                # Define the output directory for images
-                images_dir = os.path.join(output_dir, 'images')  # Use the existing output_dir
-                os.makedirs(images_dir, exist_ok=True)
-                logger.debug(f"Images directory: {images_dir}")
-
-                # Define the full path to save the image
-                img_path = os.path.join(images_dir, filename)
-                logger.debug(f"Full image path: {img_path}")
-
-                # Save the screenshot
-                with open(img_path, 'wb') as f:
-                    f.write(screenshot)
-                logger.debug("Screenshot saved for Method 2.")
-
-                # Perform OCR and other processing
-                draw_bbox_config = {
-                    'text_scale': 0.8,
-                    'text_thickness': 2,
-                    'text_padding': 3,
-                    'thickness': 3,
-                }
-                box_threshold_value = 0.03  # Example correction
-
-                logger.debug("Method 2: Starting OCR processing with check_ocr_box.")
+            # Capture screenshot and page source once using Selenium/UC
+            logger.debug("Capturing screenshot and obtaining page source using Selenium/UC.")
+            screenshot, page_source = _capture_screenshot(url)
+            if not page_source:
+                logger.error("Failed to obtain page source using Selenium/UC.")
+                extracted_texts['Method_1_Selenium_UC'] = None
+            else:
+                # Method 1: Use page_source
                 try:
-                    ocr_bbox_rslt, is_goal_filtered = check_ocr_box(
-                        image_path=img_path,
-                        display_img=False,
-                        output_bb_format='xyxy',
-                        goal_filtering=None,
-                        easyocr_args={'paragraph': False, 'text_threshold': 0.9},
-                        use_paddleocr=True
-                    )
-                except Exception as e:
-                    logger.exception(f"Method 2: OCR processing failed: {e}")
-                    ocr_bbox_rslt = None
-                if ocr_bbox_rslt is None:
-                    logger.error("Method 2: OCR bbox result is None.")
-                    extracted_texts['Method_2_Check_OCR_Box'] = None
-                else:
-                    text, ocr_bbox = ocr_bbox_rslt
-                    logger.debug(f"Method 2: OCR text length: {len(text)}, number of OCR boxes: {len(ocr_bbox)}")
+                    method_name = 'Method_1_Selenium_UC'
+                    cleaned_html = _clean_html_content(page_source)
+                    text_content = _extract_text_from_html(cleaned_html)
+                    text_content = _cleanup_extracted_text(text_content)
+                    extracted_texts[method_name] = text_content
+                    logger.debug("Method 1: Cleaned and extracted text from Selenium/UC page source.")
 
-                    logger.debug("Method 2: Starting SOM label extraction.")
-                    som_result = get_som_labeled_img(
-                        img_path=img_path,
-                        model=som_model,
-                        BOX_TRESHOLD=box_threshold_value,
-                        output_coord_in_ratio=False,
-                        ocr_bbox=ocr_bbox,  # Pass the actual OCR bounding boxes
-                        draw_bbox_config=draw_bbox_config,
-                        caption_model_processor=caption_model_processor,
-                        ocr_text=text,  # Pass the extracted text
-                        use_local_semantics=True,
-                        iou_threshold=0.1
-                    )
-                    if som_result is None:
-                        logger.error("Method 2: SOM labeled image result is None.")
-                        extracted_texts['Method_2_SOM_Labeling'] = None
-                    else:
-                        dino_labeled_img, label_coordinates, parsed_content_list = som_result
-                        method_name = 'Method_2_SOM_Labeling'
-                        extracted_texts[method_name] = parsed_content_list
-                        logger.debug(f"Method 2: Parsed content list length: {len(parsed_content_list)}")
-                        
-                        # Write the extracted content to a text file
-                        filename = f"{domain}_{url_hash}_{method_name}.txt"
-                        filename = re.sub(r'\W+', '_', filename)  # Sanitize filename
-                        file_path = os.path.join(images_dir, filename)
-                        with open(file_path, 'w', encoding='utf-8') as f:
-                            f.write(json.dumps(parsed_content_list, indent=2))
-                        logger.debug(f"Extracted content from Method 2 written to {file_path}")
-            except TypeError as e:
-                logger.exception(f"Method 2 failed: {e}")
-                extracted_texts['Method_2_Check_OCR_Box'] = None
-            except Exception as e:
-                logger.exception(f"Method 2 failed: {e}")
-                extracted_texts['Method_2_Check_OCR_Box'] = None
-
-            # Method 3: Use pytesseract to OCR process the screenshot
-            try:
-                extracted_text_pytesseract = extract_text_with_pytesseract(screenshot)
-                method_name = 'Method_3_Pytesseract'
-                if extracted_text_pytesseract:
-                    extracted_texts[method_name] = extracted_text_pytesseract
-                    logger.debug("Method 3: Pytesseract OCR successful.")
-                    
                     # Write the extracted text to a text file
                     filename = f"{domain}_{url_hash}_{method_name}.txt"
                     filename = re.sub(r'\W+', '_', filename)  # Sanitize filename
                     file_path = os.path.join(images_dir, filename)
                     with open(file_path, 'w', encoding='utf-8') as f:
-                        f.write(extracted_text_pytesseract)
-                    logger.debug(f"Extracted text from Method 3 written to {file_path}")
-                else:
-                    logger.error("Method 3: Pytesseract returned empty text.")
-                    extracted_texts[method_name] = None
-            except Exception as e:
-                logger.exception(f"Method 3 failed: {e}")
+                        f.write(text_content)
+                    logger.debug(f"Extracted text from Method 1 written to {file_path}")
+                except Exception as e:
+                    logger.exception(f"Method 1 failed: {e}")
+                    extracted_texts['Method_1_Selenium_UC'] = None
+
+            # Method 2: Perform OCR with SOM labeling using the screenshot
+            if screenshot:
+                try:
+                    logger.debug("Method 2: Performing OCR with SOM labeling on the screenshot.")
+                    # Save the screenshot
+                    filename_first_part = f"{domain}_{url_hash}"
+                    filename_first_part = re.sub(r'\W+', '_', filename_first_part)  # Sanitize filename
+                    filename = f"{filename_first_part}_Method_2_Check_OCR_Box.png"
+                    img_path = os.path.join(images_dir, filename)
+                    with open(img_path, 'wb') as f:
+                        f.write(screenshot)
+                    logger.debug("Method 2: Screenshot saved.")
+
+                    # Perform OCR and SOM labeling
+                    try:
+                        ocr_bbox_rslt, is_goal_filtered = check_ocr_box(
+                            image_path=img_path,
+                            display_img=False,
+                            output_bb_format='xyxy',
+                            goal_filtering=None,
+                            easyocr_args={'paragraph': False, 'text_threshold': 0.9},
+                            use_paddleocr=True
+                        )
+                        if ocr_bbox_rslt is None:
+                            logger.error("Method 2: OCR bbox result is None.")
+                            extracted_texts['Method_2_Check_OCR_Box'] = None
+                        else:
+                            text, ocr_bbox = ocr_bbox_rslt
+                            logger.debug(f"Method 2: OCR text length: {len(text)}, number of OCR boxes: {len(ocr_bbox)}")
+
+                            som_result = get_som_labeled_img(
+                                img_path=img_path,
+                                model=som_model,
+                                BOX_TRESHOLD=0.03,  # Example threshold
+                                output_coord_in_ratio=False,
+                                ocr_bbox=ocr_bbox,  # Pass the actual OCR bounding boxes
+                                draw_bbox_config={
+                                    'text_scale': 0.8,
+                                    'text_thickness': 2,
+                                    'text_padding': 3,
+                                    'thickness': 3,
+                                },
+                                caption_model_processor=caption_model_processor,
+                                ocr_text=text,  # Pass the extracted text
+                                use_local_semantics=True,
+                                iou_threshold=0.1
+                            )
+                            if som_result is None:
+                                logger.error("Method 2: SOM labeled image result is None.")
+                                extracted_texts['Method_2_SOM_Labeling'] = None
+                            else:
+                                dino_labeled_img, label_coordinates, parsed_content_list = som_result
+                                method_label = 'Method_2_SOM_Labeling'
+                                logger.debug(f"Method 2: Parsed content length: {len(parsed_content_list)}")
+                                cleaned_extract = _clean_som_output(parsed_content_list)
+                                extracted_texts[method_label] = cleaned_extract
+
+                                logger.debug(f"Method 2: Cleaned parsed content length: {len(cleaned_extract)}")
+
+                                # Write the extracted content to a text file
+                                filename = f"{domain}_{url_hash}_{method_label}.txt"
+                                filename = re.sub(r'\W+', '_', filename)  # Sanitize filename
+                                file_path = os.path.join(images_dir, filename)
+                                with open(file_path, 'w', encoding='utf-8') as f:
+                                    f.write(cleaned_extract)
+                                logger.debug(f"Extracted content from Method 2 written to {file_path}")
+                    except Exception as e:
+                        logger.exception(f"Method 2: OCR processing failed: {e}")
+                        extracted_texts['Method_2_Check_OCR_Box'] = None
+                except Exception as e:
+                    logger.exception(f"Method 2 failed: {e}")
+                    extracted_texts['Method_2_Check_OCR_Box'] = None
+            else:
+                logger.error("Screenshot not available for Methods 2 and 3.")
+                extracted_texts['Method_2_Check_OCR_Box'] = None
+                extracted_texts['Method_3_Pytesseract'] = None
+
+            # Method 3: Use pytesseract to OCR the screenshot
+            if screenshot:
+                try:
+                    logger.debug("Method 3: Using pytesseract for OCR on screenshot.")
+                    extracted_text_pytesseract = _extract_text_with_pytesseract(screenshot)
+                    method_name = 'Method_3_Pytesseract'
+                    if extracted_text_pytesseract:
+                        extracted_texts[method_name] = extracted_text_pytesseract
+                        logger.debug("Method 3: Pytesseract OCR successful.")
+
+                        # Write the extracted text to a text file
+                        filename = f"{domain}_{url_hash}_{method_name}.txt"
+                        filename = re.sub(r'\W+', '_', filename)  # Sanitize filename
+                        file_path = os.path.join(images_dir, filename)
+                        with open(file_path, 'w', encoding='utf-8') as f:
+                            f.write(extracted_text_pytesseract)
+                        logger.debug(f"Extracted text from Method 3 written to {file_path}")
+                    else:
+                        logger.error("Method 3: Pytesseract returned empty text.")
+                        extracted_texts[method_name] = None
+                except Exception as e:
+                    logger.exception(f"Method 3 failed: {e}")
+                    extracted_texts['Method_3_Pytesseract'] = None
+            else:
                 extracted_texts['Method_3_Pytesseract'] = None
 
             # Method 4: Use requests to fetch the page and clean it up
             try:
-                page_source_content_result = execute_task("extract_page_source_content", {"url": url}, cache)
+                logger.debug("Method 4: Fetching and cleaning content using requests.")
+                page_source_content_result = _extract_page_source_content({"url": url}, cache)
                 method_name = 'Method_4_Requests'
                 if 'extracted_text' in page_source_content_result:
                     extracted_texts[method_name] = page_source_content_result['extracted_text']
                     logger.debug("Method 4: Fetched and cleaned content using requests.")
-                    
+
                     # Write the extracted text to a text file
                     filename = f"{domain}_{url_hash}_{method_name}.txt"
                     filename = re.sub(r'\W+', '_', filename)  # Sanitize filename
@@ -618,67 +506,480 @@ def extract_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
             logger.error("All extraction methods failed.")
             return {"error": "All extraction methods failed."}
     except Exception as e:
-        logger.exception(f"An unexpected error occurred during content extraction: {e}")
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-    
-TASK_FUNCTIONS["extract_content"] = extract_content
+        logger.exception(f"An error occurred during content extraction: {e}")
+        return {"error": f"An error occurred during content extraction: {str(e)}"}
 
-def is_content_valuable(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
-    extracted_text = task_params.get('extracted_text')
-    question = task_params.get('question')
-    if not extracted_text or not question:
-        logger.error("Both 'extracted_text' and 'question' must be provided for content validation.")
-        return {"error": "Both 'extracted_text' and 'question' must be provided for content validation."}
+def validate_fact(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
+    statement = task_params.get('statement')
+    logger.debug(f"Validating fact: {statement}")
+    if not statement:
+        logger.error("No statement provided for validation.")
+        return {"error": "No statement provided for validation."}
 
-    logger.debug("Validating extracted content using LLM.")
+    # Step 1: Extract entities from the statement
+    try:
+        doc = nlp(statement)
+        entities = [ent.text for ent in doc.ents if ent.label_ in ('ORG', 'GPE', 'PERSON', 'PRODUCT')]
+        logger.debug(f"Extracted entities: {entities}")
+    except Exception as e:
+        logger.exception("An error occurred while extracting entities from the statement.")
+        entities = []
+
+    # Step 2: Perform a search query to find relevant pages
+    search_results = execute_task("search_query", {'query': statement}, cache)
+    if 'error' in search_results:
+        logger.error(f"Failed to retrieve search results: {search_results['error']}")
+        return {"error": f"Failed to retrieve search results: {search_results['error']}"}
+
+    # Step 3: Extract content from each search result
+    verified_sources = []
+    for result in search_results.get('search_results', []):
+        url = result.get('url')
+
+        # Check if the URL is from a reputable source using execute_task
+        reputable_result = execute_task("is_reputable_source", {"url": url}, cache)
+        if reputable_result.get("is_reputable"):
+            content_result = execute_task("extract_content", {'url': url, 'question': statement}, cache)
+
+            if 'extracted_text' in content_result:
+                page_content = content_result['extracted_text']
+                page_content_str = page_content.lower()
+                if statement.lower() in page_content_str:
+                    verified_sources.append(url)
+            elif 'error' in content_result:
+                logger.error(f"Error extracting content from URL {url}: {content_result['error']}")
+        else:
+            logger.debug(f"Skipping non-reputable source: {url}")
+
+    # Step 4: Calculate confidence based on verified sources
+    is_true = bool(verified_sources)
+    confidence = min(1.0, 0.2 + len(verified_sources) * 0.2)  # Confidence increases with more sources
+
+    logger.debug(f"Fact validation result - is_true: {is_true}, confidence: {confidence}, sources: {verified_sources}")
+
+    return {
+        "is_true": is_true,
+        "confidence": confidence,
+        "sources": verified_sources
+    }
+
+def is_reputable_source(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
+    url = task_params.get('url')
+    if not url:
+        logger.error("No URL provided for reputation check.")
+        return {"error": "No URL provided for reputation check."}
+
+    logger.debug(f"Checking if URL is from a reputable source: {url}")
 
     # Construct prompt for LLM requesting JSON response
     prompt = (
-        "Determine whether the following content is valuable for answering the given question. "
-        "Content that is a denial, a warning notice, a cookie policy, or an empty page should be considered not valuable.\n\n"
-        f"Question:\n{question}\n\nContent:\n{extracted_text}\n\n"
+        "Determine whether the following URL is from a reputable and credible source. "
+        "Consider international government sites, major tech companies like Microsoft, Apple, Nvidia, universities, "
+        "and reputable news outlets like BBC as reputable sources. Do not consider sources known for fake news like Fox News as reputable. "
+        "Answer with a JSON object containing only a boolean field 'is_reputable'.\n\n"
+        f"URL: {url}\n\nIs this a reputable source? Respond in the following JSON format:\n"
+        "{\n"
+        "  \"is_reputable\": true\n"
+        "}"
+    )
+
+    try:
+        response = send_llm_request(
+            prompt,
+            cache,
+            IS_REPUTABLE_SOURCE_MODEL_NAME,
+            OLLAMA_URL,
+            expect_json=True  # Expecting a JSON response
+        )
+        # Validate and extract the 'is_reputable' field from the JSON response
+        is_reputable = response.get("is_reputable")
+        if isinstance(is_reputable, bool):
+            logger.debug(f"LLM determined 'is_reputable': {is_reputable}")
+            return {"is_reputable": is_reputable}
+        else:
+            logger.error(f"LLM response missing 'is_reputable' field or invalid format: {response}")
+            return {"error": "Invalid LLM response format for reputation check."}
+    except json.JSONDecodeError:
+        logger.exception("Failed to parse JSON response from LLM for reputation check.")
+        return {"error": "Failed to parse JSON response from LLM."}
+    except Exception as e:
+        logger.exception("An error occurred during source reputation check.")
+        return {"error": f"An error occurred during source reputation check: {str(e)}"}
+
+def summarize_text(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
+    text = task_params.get('text', '')
+    question = task_params.get('question')
+    logger.debug("Summarizing text.")
+    if not text:
+        logger.error("No text provided for summarization.")
+        return {"error": "No text provided for summarization."}
+    if not question:
+        logger.error("No question provided for summarization.")
+        return {"error": "No question provided for summarization."}
+
+    prompt = (
+        "Provide a summary of the following text, focusing on relevant information for answering the given question. Be detailed/specific on suppliers, products, capabilities, and other key details such as strategy and vision.\n\n"
+        "Do not include any introductions, comments about the summarization process, or closing remarks.\n\n"
+        f"Question:\n{question}\n\nText:\n{text}\n\nSummary:"
+    )
+
+    try:
+        summary = send_llm_request(prompt, cache, SUMMARIZER_MODEL_NAME, OLLAMA_URL, expect_json=False)
+        logger.debug(f"Generated summary: {summary}")
+        return {"summary": summary.strip()}
+    except Exception as e:
+        logger.exception("An error occurred while summarizing text.")
+        return {"error": f"An error occurred while summarizing text: {str(e)}"}
+
+def analyze_sentiment(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
+    text = task_params.get('text')
+    logger.debug("Analyzing sentiment.")
+    if not text:
+        logger.error("No text provided for sentiment analysis.")
+        return {"error": "No text provided for sentiment analysis."}
+    try:
+        sia = SentimentIntensityAnalyzer()
+        sentiment_scores = sia.polarity_scores(text)
+        # Determine the sentiment
+        compound = sentiment_scores['compound']
+        if compound >= 0.05:
+            sentiment = 'positive'
+        elif compound <= -0.05:
+            sentiment = 'negative'
+        else:
+            sentiment = 'neutral'
+        confidence = abs(compound)
+        logger.debug(f"Sentiment analysis result: sentiment={sentiment}, confidence={confidence}")
+        return {"sentiment": sentiment, "confidence": confidence}
+    except Exception as e:
+        logger.exception("An error occurred while analyzing sentiment.")
+        return {"error": f"An error occurred while analyzing sentiment: {str(e)}"}
+
+def extract_entities(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
+    text = task_params.get('text')
+    logger.debug("Extracting entities.")
+    if not text:
+        logger.error("No text provided for entity extraction.")
+        return {"error": "No text provided for entity extraction."}
+    try:
+        doc = nlp(text)
+        entities = []
+        for ent in doc.ents:
+            entities.append({"type": ent.label_, "entity": ent.text})
+        logger.debug(f"Extracted entities: {entities}")
+        return {"entities": entities}
+    except Exception as e:
+        logger.exception("An error occurred while extracting entities.")
+        return {"error": f"An error occurred while extracting entities: {str(e)}"}
+
+def answer_question(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
+    question = task_params.get('question')
+    context = task_params.get('context')
+    logger.debug(f"Answering question: {question}")
+    if not question or not context:
+        logger.error("Both 'question' and 'context' must be provided.")
+        return {"error": "Both 'question' and 'context' must be provided."}
+
+    prompt = (
+        "Based on the following context, please provide a detailed and accurate answer to the question.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question:\n{question}\n\n"
+        "Answer:"
+    )
+
+    try:
+        answer = send_llm_request(prompt, cache, SUMMARIZER_MODEL_NAME, OLLAMA_URL, expect_json=False)
+        logger.debug(f"Generated answer: {answer}")
+        return {"answer": answer}
+    except Exception as e:
+        logger.exception("An error occurred while answering question.")
+        return {"error": f"An error occurred while answering question: {str(e)}"}
+
+def extract_text_from_image(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
+    image_path = task_params.get('image_path')
+    logger.debug(f"Extracting text from image: {image_path}")
+    if not image_path:
+        logger.error("No image path provided for text extraction.")
+        return {"error": "No image path provided for text extraction."}
+    # Ensure that tesseract is installed and configured properly
+    try:
+        image = Image.open(image_path)
+        extracted_text = pytesseract.image_to_string(image)
+        logger.debug(f"Extracted text from image: {extracted_text}")
+        return {"extracted_text": extracted_text}
+    except Exception as e:
+        logger.exception("An error occurred while extracting text from image.")
+        return {"error": f"An error occurred while extracting text from image: {str(e)}"}
+
+def translate_text(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
+    text = task_params.get('text')
+    language = task_params.get('language')
+    logger.debug(f"Translating text to {language}.")
+
+    if not text:
+        logger.error("No text provided for translation.")
+        return {"error": "No text provided for translation."}
+    if not language:
+        logger.error("No target language specified for translation.")
+        return {"error": "No target language specified for translation."}
+
+    try:
+        translator = Translator(to_lang=language)
+        translated_text = translator.translate(text)
+        logger.debug(f"Translated text: {translated_text}")
+        return {"translated_text": translated_text}
+    except Exception as e:
+        logger.exception("An error occurred during translation.")
+        return {"error": f"Translation failed: {str(e)}"}
+
+def parse_json(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
+    file_path = task_params.get('file_path')
+    logger.debug(f"Parsing JSON file: {file_path}")
+    if not file_path:
+        logger.error("No file path provided for JSON parsing.")
+        return {"error": "No file path provided for JSON parsing."}
+    try:
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+        logger.debug(f"Parsed JSON data: {data}")
+        return {"parsed_data": data}
+    except Exception as e:
+        logger.exception("An error occurred while parsing JSON.")
+        return {"error": f"An error occurred while parsing JSON: {str(e)}"}
+
+def extract_keywords(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
+    text = task_params.get('text')
+    logger.debug("Starting keyword extraction process.")
+    
+    if not text:
+        logger.error("No text provided for keyword extraction.")
+        return {"error": "No text provided for keyword extraction."}
+
+    # Step 1: Ensure required NLTK resources are available
+    required_resources = ['punkt', 'stopwords']
+    for resource in required_resources:
+        try:
+            resource_path = f'tokenizers/{resource}' if resource == 'punkt' else f'corpora/{resource}'
+            nltk.data.find(resource_path)
+            logger.debug(f"NLTK resource '{resource}' is already available.")
+        except LookupError:
+            logger.debug(f"Downloading missing NLTK resource: '{resource}'")
+            nltk.download(resource, quiet=True)
+            try:
+                nltk.data.find(resource_path)
+                logger.debug(f"Successfully downloaded NLTK resource: '{resource}'")
+            except LookupError:
+                logger.error(f"Failed to download NLTK resource: '{resource}'")
+                return {"error": f"Required NLTK resource '{resource}' is missing and could not be downloaded."}
+
+    # Step 2: Initialize Rake and extract keywords
+    try:
+        rake_nltk_var = Rake(language='english')
+        logger.debug("Rake initialized successfully with language='english'. Extracting keywords from text.")
+        
+        # Extract keywords
+        rake_nltk_var.extract_keywords_from_text(text)
+        keywords = rake_nltk_var.get_ranked_phrases()
+        logger.debug(f"Extracted keywords: {keywords}")
+
+        return {"keywords": keywords}
+    except LookupError as e:
+        # Handle specific NLTK lookup errors
+        logger.exception("A LookupError occurred during keyword extraction.")
+        return {"error": f"A LookupError occurred during keyword extraction: {str(e)}"}
+    except Exception as e:
+        # Log any other exceptions
+        logger.exception("An unexpected error occurred during keyword extraction.")
+        return {"error": f"An unexpected error occurred during keyword extraction: {str(e)}"}
+
+def evaluate_question_focus(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
+    question = task_params.get('question')
+    if not question:
+        logger.error("No question provided for focus evaluation.")
+        return {"error": "No question provided for focus evaluation."}
+
+    logger.debug(f"Evaluating focus of question: {question}")
+
+    # Construct prompt for LLM requesting JSON response
+    prompt = (
+        "Determine whether the following question is focused and detailed enough to be considered a single-topic question with an answer that can be a couple of concise sentences. "
+        "An example of a focused question is: What are recent NVIDIA AI products. "
+        "An example of a question which is not focused is: write a detailed report on recent advancements in the area of AI.\n\n"
+        "A focused question should be specific, clear, and centered around one main topic without multiple unrelated subtopics. "
+        "It should not be abstract but concrete and answerable.\n\n"
+        "Respond with a JSON object containing only a boolean field 'is_focused'.\n"
+        "{\n"
+        "  \"is_focused\": true\n"
+        "}\n\n"
+        f"Question:\n{question}\n\nIs this question focused and detailed on a single topic?"
+    )
+
+    try:
+        response = send_llm_request(
+            prompt,
+            cache,
+            EVALUATE_QUESTION_FOCUS_MODEL_NAME,
+            OLLAMA_URL,
+            expect_json=True  # Expecting a JSON response
+        )
+        # Validate and extract the 'is_focused' field from the JSON response
+        is_focused = response.get("is_focused")
+        if isinstance(is_focused, bool):
+            logger.debug(f"LLM determined 'is_focused': {is_focused}")
+            return {"is_focused": is_focused}
+        else:
+            logger.error(f"LLM response missing 'is_focused' field or invalid format: {response}")
+            return {"error": "Invalid LLM response format for question focus evaluation."}
+    except json.JSONDecodeError:
+        logger.exception("Failed to parse JSON response from LLM for question focus evaluation.")
+        return {"error": "Failed to parse JSON response from LLM."}
+    except Exception as e:
+        logger.exception("An error occurred during question focus evaluation.")
+        return {"error": f"An error occurred during question focus evaluation: {str(e)}"}
+
+def evaluate_summary(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
+    """
+    Evaluate whether a summary is valuable for inclusion in the final answer.
+
+    Args:
+        task_params (Dict[str, Any]): Parameters containing 'summary' and 'question'.
+        cache (Any): Optional cache parameter.
+
+    Returns:
+        Dict[str, Any]: Evaluation result indicating if the summary is valuable.
+    """
+    summary = task_params.get('summary')
+    question = task_params.get('question')
+    if not summary or not question:
+        logger.error("Both 'summary' and 'question' must be provided for summary evaluation.")
+        return {"error": "Both 'summary' and 'question' must be provided for summary evaluation."}
+
+    logger.debug(f"Evaluating summary: {summary} for question: {question}")
+
+    # Construct prompt for LLM requesting JSON response
+    prompt = (
+        "Determine whether the following summary is valuable for inclusion in the final answer to the given question. "
+        "A valuable summary should be relevant, concise, and provide clear insights that directly address the question. "
+        "An error message, a security warning, or a cookie policy is not valuable. "
+        "But news relevant to answering the question is.\n\n"
+        "Avoid summaries that are off-topic, too vague, or redundant.\n\n"
+        f"Question:\n{question}\n\nSummary:\n{summary}\n\n"
         "Respond with a JSON object containing only a boolean field 'is_valuable'.\n"
         "{\n"
         "  \"is_valuable\": true\n"
         "}"
     )
+
     try:
         response = send_llm_request(
             prompt,
             cache,
-            IS_CONTENT_VALUABLE_MODEL_NAME,
+            EVALUATE_SUMMARY_MODEL_NAME,
             OLLAMA_URL,
             expect_json=True  # Expecting a JSON response
         )
         # Validate and extract the 'is_valuable' field from the JSON response
         is_valuable = response.get("is_valuable")
         if isinstance(is_valuable, bool):
-            logger.debug(f"LLM determined 'is_valuable': {is_valuable}")
+            logger.debug(f"LLM determined 'is_valuable' for summary: {is_valuable}")
             return {"is_valuable": is_valuable}
         else:
             logger.error(f"LLM response missing 'is_valuable' field or invalid format: {response}")
-            return {"error": "Invalid LLM response format for content validation."}
+            return {"error": "Invalid LLM response format for summary evaluation."}
     except json.JSONDecodeError:
-        logger.exception("Failed to parse JSON response from LLM for content validation.")
+        logger.exception("Failed to parse JSON response from LLM for summary evaluation.")
         return {"error": "Failed to parse JSON response from LLM."}
     except Exception as e:
-        logger.exception("An error occurred during content validation.")
-        return {"error": f"An error occurred during content validation: {str(e)}"}
-    
-TASK_FUNCTIONS["is_content_valuable"] = is_content_valuable
+        logger.exception("An error occurred during summary evaluation.")
+        return {"error": f"An error occurred during summary evaluation: {str(e)}"}
 
-def capture_screenshot(url: str, max_retries: int = 3, delay: int = 5) -> Optional[Tuple[bytes, str]]:
+# Register only public tasks
+for task in list_tasks():
+    task_name = task["name"]
+    try:
+        TASK_FUNCTIONS_PUBLIC[task_name] = globals()[task_name]
+        logger.debug(f"Registered task function: {task_name}")
+    except KeyError:
+        logger.error(f"Function '{task_name}' is not defined and cannot be registered.")
+
+# -------------------- Private Task Function Implementations --------------------
+
+def _fetch_youtube_transcript(url: str) -> Dict[str, Any]:
     """
-    Capture a screenshot of the given URL and return the image bytes and page source.
-    If it fails after retries, returns (None, None).
+    Private helper function to fetch YouTube transcript.
+    """
+    logger.debug(f"Fetching YouTube transcript for URL: {url}")
+    try:
+        # Extract the video ID from the URL
+        parsed_url = urlparse(url)
+        if 'youtube.com' in parsed_url.netloc:
+            query_params = dict([part.split('=') for part in parsed_url.query.split('&') if '=' in part])
+            video_id = query_params.get('v')
+        elif 'youtu.be' in parsed_url.netloc:
+            video_id = parsed_url.path.lstrip('/')
+        else:
+            logger.error("Invalid YouTube URL format.")
+            return {"error": "Invalid YouTube URL format."}
+        
+        if not video_id:
+            logger.error("Video ID not found in the URL.")
+            return {"error": "Video ID not found in the URL."}
+        
+        # Fetch the transcript using YouTubeTranscriptApi
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+        transcript_text = " ".join([entry['text'] for entry in transcript_list])
+        logger.debug("Transcript fetched successfully.")
+        return {"transcript": transcript_text}
+    except VideoUnavailable:
+        logger.error("The video is unavailable.")
+        return {"error": "The video is unavailable."}
+    except TranscriptsDisabled:
+        logger.error("Transcripts are disabled for this video.")
+        return {"error": "Transcripts are disabled for this video."}
+    except NoTranscriptFound:
+        logger.error("No transcript found for this video.")
+        return {"error": "No transcript found for this video."}
+    except Exception as e:
+        logger.exception("An unexpected error occurred while fetching the transcript.")
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
+def _extract_page_source_content(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
+    """
+    Extract text content from the page source of a URL.
 
     Args:
-        url (str): The URL to capture.
-        max_retries (int): Number of retries for loading the URL.
-        delay (int): Delay in seconds between retries.
+        task_params (Dict[str, Any]): Parameters containing 'url'.
+        cache (Any): Optional cache parameter.
 
     Returns:
-        Tuple[bytes, str]: Screenshot bytes and page source, or (None, None) if failed.
+        Dict[str, Any]: Extracted text or error information.
+    """
+    url = task_params.get('url')
+    logger.debug(f"Fetching page source content from URL: {url}")
+    if not url:
+        logger.error("No URL provided for page source extraction.")
+        return {"error": "No URL provided for page source extraction."}
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        logger.debug("Page fetched successfully via requests.")
+        cleaned_html = _clean_html_content(response.content)
+        text_content = _extract_text_from_html(cleaned_html)
+        text_content = _cleanup_extracted_text(text_content)
+        logger.debug(f"Extracted text length: {len(text_content)}")
+        return {"extracted_text": text_content}
+    except requests.RequestException as e:
+        logger.exception(f"Failed to fetch URL via requests: {url}")
+        return {"error": f"Failed to fetch URL via requests: {str(e)}"}
+    except Exception as e:
+        logger.exception(f"An unexpected error occurred during page source extraction: {e}")
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
+def _capture_screenshot(url: str, max_retries: int = 3, delay: int = 5) -> Optional[Tuple[bytes, str]]:
+    """
+    Private helper function to capture a screenshot of the given URL and return the image bytes and page source.
+    If it fails after retries, returns (None, None).
     """
     logger.debug(f"Capturing screenshot for URL: {url}")
 
@@ -692,14 +993,11 @@ def capture_screenshot(url: str, max_retries: int = 3, delay: int = 5) -> Option
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")  # Use the new headless mode
     chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("--disable-infobars")
     chrome_options.add_argument("--start-maximized")
-    chrome_options.add_argument("--disable-popup-blocking")
     chrome_options.add_argument("--ignore-certificate-errors")
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
 
     # Initialize the undetected Chrome WebDriver with use_subprocess=True
     try:
@@ -744,6 +1042,7 @@ def capture_screenshot(url: str, max_retries: int = 3, delay: int = 5) -> Option
                 "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'proceed')]",
                 "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'allow')]",
                 "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'consent')]",
+                "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'confirm')]",
                 "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'ok')]",
                 "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')]",
                 "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'save changes')]",
@@ -755,7 +1054,7 @@ def capture_screenshot(url: str, max_retries: int = 3, delay: int = 5) -> Option
                     for button in buttons:
                         if button.is_displayed() and button.is_enabled():
                             logger.debug(f"Found cookie button with XPath: {xpath}, attempting to click.")
-                            simulate_human_mouse_movement(driver, button)
+                            _simulate_human_mouse_movement(driver, button)
                             WebDriverWait(driver, 5).until(EC.invisibility_of_element(button))
                             logger.debug("Cookie banner handled successfully.")
                             break  # Exit after clicking one button
@@ -829,12 +1128,63 @@ def capture_screenshot(url: str, max_retries: int = 3, delay: int = 5) -> Option
         except Exception as e:
             logger.warning(f"An error occurred while quitting the WebDriver: {e}")
 
-def simulate_human_mouse_movement(driver, element):
+def _extract_text_with_pytesseract(screenshot_bytes: bytes) -> Optional[str]:
     """
-    Simulate human-like mouse movement to interact with a web element.
+    Use pytesseract to extract text from screenshot bytes.
+
+    Args:
+        screenshot_bytes (bytes): The screenshot image in bytes.
+
+    Returns:
+        Optional[str]: The extracted text or None if extraction fails.
+    """
+    try:
+        logger.debug("Method 3: Starting pytesseract OCR on screenshot.")
+        image = Image.open(io.BytesIO(screenshot_bytes))
+        extracted_text = pytesseract.image_to_string(image)
+        logger.debug("Method 3: Pytesseract OCR completed successfully.")
+        return extracted_text.strip()
+    except Exception as e:
+        logger.exception(f"Method 3: Pytesseract OCR failed: {e}")
+        return None
+
+def _clean_som_output(output: list) -> str:
+    """
+    Cleans the SOM labeling output to remove references to boxes and returns a concatenated string
+    with each entry on a new line.
+
+    Args:
+        output (list): List of labeled text from SOM labeling.
+
+    Returns:
+        str: Cleaned concatenated string with each entry on a new line.
+    """
+    cleaned_lines = []
+    
+    # Process each item in the input list
+    for item in output:
+        # Check if item contains a colon and split if it does
+        if ": " in item:
+            # Extract the content after the identifier
+            cleaned_text = item.split(": ", 1)[-1].strip()
+        else:
+            # If no colon, keep the whole item if it's not empty
+            cleaned_text = item.strip()
+
+        # Add to cleaned lines if not empty
+        if cleaned_text:
+            cleaned_lines.append(cleaned_text)
+    
+    # Join all cleaned lines into a single string with newlines
+    return "\n".join(cleaned_lines)
+
+def _simulate_human_mouse_movement(driver, element):
+    """
+    Private helper function to simulate human-like mouse movement to interact with a web element.
     """
     from selenium.webdriver.common.action_chains import ActionChains
     import numpy as np
+    import random
 
     try:
         # Get the location and size of the element
@@ -873,9 +1223,9 @@ def simulate_human_mouse_movement(driver, element):
         # If simulation fails, proceed without it
         pass
 
-def clean_html_content(html_content: bytes) -> str:
+def _clean_html_content(html_content: bytes) -> str:
     """
-    Clean the HTML content by removing unnecessary tags and elements.
+    Private helper function to clean the HTML content by removing unnecessary tags and elements.
     """
     soup = BeautifulSoup(html_content, 'html.parser')
     for element in soup(['script', 'style', 'header', 'footer', 'nav', 'aside', 'form']):
@@ -897,437 +1247,37 @@ def clean_html_content(html_content: bytes) -> str:
         logger.error(f"Error in cleaning HTML: {e}")
         return ""
 
-def extract_text_from_html(cleaned_html: str) -> str:
+def _extract_text_from_html(cleaned_html: str) -> str:
     """
-    Extract text from cleaned HTML content.
+    Private helper function to extract text from cleaned HTML content.
     """
     soup = BeautifulSoup(cleaned_html, 'html.parser')
     return soup.get_text(separator='\n')
 
-def cleanup_extracted_text(text: str) -> str:
+def _cleanup_extracted_text(text: str) -> str:
     """
-    Cleanup the extracted text by removing excessive whitespace and formatting.
+    Private helper function to cleanup the extracted text by removing excessive whitespace and formatting.
     """
     text = re.sub(r'\n\s*\n', '\n\n', text)
     text = '\n'.join([line.strip() for line in text.split('\n')])
     text = re.sub(r'\s+', ' ', text)
     return text
 
-def validate_fact(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
-    statement = task_params.get('statement')
-    logger.debug(f"Validating fact: {statement}")
-    if not statement:
-        logger.error("No statement provided for validation.")
-        return {"error": "No statement provided for validation."}
-
-    # Step 1: Extract entities from the statement
-    try:
-        doc = nlp(statement)
-        entities = [ent.text for ent in doc.ents if ent.label_ in ('ORG', 'GPE', 'PERSON', 'PRODUCT')]
-        logger.debug(f"Extracted entities: {entities}")
-    except Exception as e:
-        logger.exception("An error occurred while extracting entities from the statement.")
-        entities = []
-
-    # Step 2: Perform a search query to find relevant pages
-    search_results = execute_task("search_query", {'query': statement}, cache)
-    if 'error' in search_results:
-        logger.error(f"Failed to retrieve search results: {search_results['error']}")
-        return {"error": f"Failed to retrieve search results: {search_results['error']}"}
-
-    # Step 3: Extract content from each search result
-    verified_sources = []
-    for result in search_results.get('search_results', []):
-        url = result.get('url')
-
-        # Check if the URL is from a reputable source using execute_task
-        reputable_result = execute_task("is_reputable_source", {"url": url}, cache)
-        if reputable_result.get("is_reputable"):
-            content_result = execute_task("extract_content", {'url': url, 'question': statement}, cache)
-
-            if 'structured_data' in content_result:
-                page_content = content_result['structured_data']
-                page_content_str = json.dumps(page_content).lower()
-                if statement.lower() in page_content_str:
-                    verified_sources.append(url)
-            elif 'error' in content_result:
-                logger.error(f"Error extracting content from URL {url}: {content_result['error']}")
-        else:
-            logger.debug(f"Skipping non-reputable source: {url}")
-
-    # Step 4: Calculate confidence based on verified sources
-    is_true = bool(verified_sources)
-    confidence = min(1.0, 0.2 + len(verified_sources) * 0.2)  # Confidence increases with more sources
-
-    logger.debug(f"Fact validation result - is_true: {is_true}, confidence: {confidence}, sources: {verified_sources}")
-
-    return {
-        "is_true": is_true,
-        "confidence": confidence,
-        "sources": verified_sources
-    }
-
-TASK_FUNCTIONS["validate_fact"] = validate_fact
-
-def is_reputable_source(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
-    url = task_params.get('url')
-    if not url:
-        logger.error("No URL provided for reputation check.")
-        return {"error": "No URL provided for reputation check."}
-
-    logger.debug(f"Checking if URL is from a reputable source: {url}")
-
-    # Construct prompt for LLM requesting JSON response
-    prompt = (
-        "Determine whether the following URL is from a reputable and credible source. "
-        "Consider international government sites, major tech companies like Microsoft, Apple, Nvidia, universities, "
-        "and reputable news outlets like BBC as reputable sources. Do not consider sources known for fake news like Fox News as reputable. "
-        "Answer with a JSON object containing only a boolean field 'is_reputable'.\n\n"
-        f"URL: {url}\n\nIs this a reputable source? Respond in the following JSON format:\n"
-        "{\n"
-        "  \"is_reputable\": true\n"
-        "}"
-    )
-
-    try:
-        response = send_llm_request(
-            prompt,
-            cache,
-            IS_REPUTABLE_SOURCE_MODEL_NAME,
-            OLLAMA_URL,
-            expect_json=True  # Expecting a JSON response
-        )
-        # Validate and extract the 'is_reputable' field from the JSON response
-        is_reputable = response.get("is_reputable")
-        if isinstance(is_reputable, bool):
-            logger.debug(f"LLM determined 'is_reputable': {is_reputable}")
-            return {"is_reputable": is_reputable}
-        else:
-            logger.error(f"LLM response missing 'is_reputable' field or invalid format: {response}")
-            return {"error": "Invalid LLM response format for reputation check."}
-    except json.JSONDecodeError:
-        logger.exception("Failed to parse JSON response from LLM for reputation check.")
-        return {"error": "Failed to parse JSON response from LLM."}
-    except Exception as e:
-        logger.exception("An error occurred during source reputation check.")
-        return {"error": f"An error occurred during source reputation check: {str(e)}"}
-
-TASK_FUNCTIONS["is_reputable_source"] = is_reputable_source
-
-def summarize_text(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
-    text = task_params.get('text', '')
-    question = task_params.get('question')
-    logger.debug("Summarizing text.")
-    if not text:
-        logger.error("No text provided for summarization.")
-        return {"error": "No text provided for summarization."}
-    if not question:
-        logger.error("No question provided for summarization.")
-        return {"error": "No question provided for summarization."}
-
-    prompt = (
-        "Provide a summary of the following text, focusing on relevant information for answering the given question. Be detailed/specific on suppliers, products, capabilities, and other key details such as strategy and vision.\n\n"
-        "Do not include any introductions, comments about the summarization process, or closing remarks.\n\n"
-        f"Question:\n{question}\n\nText:\n{text}\n\nSummary:"
-    )
-
-    try:
-        summary = send_llm_request(prompt, cache, SUMMARIZER_MODEL_NAME, OLLAMA_URL, expect_json=False)
-        logger.debug(f"Generated summary: {summary}")
-        return {"summary": summary.strip()}
-    except Exception as e:
-        logger.exception("An error occurred while summarizing text.")
-        return {"error": f"An error occurred while summarizing text: {str(e)}"}
-
-TASK_FUNCTIONS["summarize_text"] = summarize_text
-
-def analyze_sentiment(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
-    text = task_params.get('text')
-    logger.debug("Analyzing sentiment.")
-    if not text:
-        logger.error("No text provided for sentiment analysis.")
-        return {"error": "No text provided for sentiment analysis."}
-    try:
-        sia = SentimentIntensityAnalyzer()
-        sentiment_scores = sia.polarity_scores(text)
-        # Determine the sentiment
-        compound = sentiment_scores['compound']
-        if compound >= 0.05:
-            sentiment = 'positive'
-        elif compound <= -0.05:
-            sentiment = 'negative'
-        else:
-            sentiment = 'neutral'
-        confidence = abs(compound)
-        logger.debug(f"Sentiment analysis result: sentiment={sentiment}, confidence={confidence}")
-        return {"sentiment": sentiment, "confidence": confidence}
-    except Exception as e:
-        logger.exception("An error occurred while analyzing sentiment.")
-        return {"error": f"An error occurred while analyzing sentiment: {str(e)}"}
-
-TASK_FUNCTIONS["analyze_sentiment"] = analyze_sentiment
-
-def extract_entities(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
-    text = task_params.get('text')
-    logger.debug("Extracting entities.")
-    if not text:
-        logger.error("No text provided for entity extraction.")
-        return {"error": "No text provided for entity extraction."}
-    try:
-        doc = nlp(text)
-        entities = []
-        for ent in doc.ents:
-            entities.append({"type": ent.label_, "entity": ent.text})
-        logger.debug(f"Extracted entities: {entities}")
-        return {"entities": entities}
-    except Exception as e:
-        logger.exception("An error occurred while extracting entities.")
-        return {"error": f"An error occurred while extracting entities: {str(e)}"}
-
-TASK_FUNCTIONS["extract_entities"] = extract_entities
-
-def answer_question(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
-    question = task_params.get('question')
-    context = task_params.get('context')
-    logger.debug(f"Answering question: {question}")
-    if not question or not context:
-        logger.error("Both 'question' and 'context' must be provided.")
-        return {"error": "Both 'question' and 'context' must be provided."}
-
-    prompt = (
-        "Based on the following context, please provide a detailed and accurate answer to the question.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question:\n{question}\n\n"
-        "Answer:"
-    )
-
-    try:
-        answer = send_llm_request(prompt, cache, SUMMARIZER_MODEL_NAME, OLLAMA_URL, expect_json=False)
-        logger.debug(f"Generated answer: {answer}")
-        return {"answer": answer}
-    except Exception as e:
-        logger.exception("An error occurred while answering question.")
-        return {"error": f"An error occurred while answering question: {str(e)}"}
-
-TASK_FUNCTIONS["answer_question"] = answer_question
-
-def extract_text_from_image(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
-    image_path = task_params.get('image_path')
-    logger.debug(f"Extracting text from image: {image_path}")
-    if not image_path:
-        logger.error("No image path provided for text extraction.")
-        return {"error": "No image path provided for text extraction."}
-    # Ensure that tesseract is installed and configured properly
-    try:
-        image = Image.open(image_path)
-        extracted_text = pytesseract.image_to_string(image)
-        logger.debug(f"Extracted text from image: {extracted_text}")
-        return {"extracted_text": extracted_text}
-    except Exception as e:
-        logger.exception("An error occurred while extracting text from image.")
-        return {"error": f"An error occurred while extracting text from image: {str(e)}"}
-
-TASK_FUNCTIONS["extract_text_from_image"] = extract_text_from_image
-
-def translate_text(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
-    text = task_params.get('text')
-    language = task_params.get('language')
-    logger.debug(f"Translating text to {language}.")
-
-    if not text:
-        logger.error("No text provided for translation.")
-        return {"error": "No text provided for translation."}
-    if not language:
-        logger.error("No target language specified for translation.")
-        return {"error": "No target language specified for translation."}
-
-    try:
-        translator = Translator(to_lang=language)
-        translated_text = translator.translate(text)
-        logger.debug(f"Translated text: {translated_text}")
-        return {"translated_text": translated_text}
-    except Exception as e:
-        logger.exception("An error occurred during translation.")
-        return {"error": f"Translation failed: {str(e)}"}
-
-TASK_FUNCTIONS["translate_text"] = translate_text
-
-def parse_json(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
-    file_path = task_params.get('file_path')
-    logger.debug(f"Parsing JSON file: {file_path}")
-    if not file_path:
-        logger.error("No file path provided for JSON parsing.")
-        return {"error": "No file path provided for JSON parsing."}
-    try:
-        with open(file_path, 'r') as f:
-            data = json.load(f)
-        logger.debug(f"Parsed JSON data: {data}")
-        return {"parsed_data": data}
-    except Exception as e:
-        logger.exception("An error occurred while parsing JSON.")
-        return {"error": f"An error occurred while parsing JSON: {str(e)}"}
-
-TASK_FUNCTIONS["parse_json"] = parse_json
-
-def extract_keywords(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
-    text = task_params.get('text')
-    logger.debug("Starting keyword extraction process.")
-    
-    if not text:
-        logger.error("No text provided for keyword extraction.")
-        return {"error": "No text provided for keyword extraction."}
-
-    # Step 1: Ensure required NLTK resources are available
-    required_resources = ['punkt', 'stopwords']
-    for resource in required_resources:
-        try:
-            resource_path = f'tokenizers/{resource}' if resource == 'punkt' else f'corpora/{resource}'
-            nltk.data.find(resource_path)
-            logger.debug(f"NLTK resource '{resource}' is already available.")
-        except LookupError:
-            logger.debug(f"Downloading missing NLTK resource: '{resource}'")
-            try:
-                nltk.download(resource, quiet=True)
-                nltk.data.find(resource_path)
-                logger.debug(f"Successfully downloaded NLTK resource: '{resource}'")
-            except LookupError:
-                logger.error(f"Failed to download NLTK resource: '{resource}'")
-                return {"error": f"Required NLTK resource '{resource}' is missing and could not be downloaded."}
-
-    # Step 2: Initialize Rake and extract keywords
-    try:
-        rake_nltk_var = Rake(language='english')
-        logger.debug("Rake initialized successfully with language='english'. Extracting keywords from text.")
-        
-        # Extract keywords
-        rake_nltk_var.extract_keywords_from_text(text)
-        keywords = rake_nltk_var.get_ranked_phrases()
-        logger.debug(f"Extracted keywords: {keywords}")
-
-        return {"keywords": keywords}
-    except LookupError as e:
-        # Handle specific NLTK lookup errors
-        logger.exception("A LookupError occurred during keyword extraction.")
-        return {"error": f"A LookupError occurred during keyword extraction: {str(e)}"}
-    except Exception as e:
-        # Log any other exceptions
-        logger.exception("An unexpected error occurred during keyword extraction.")
-        return {"error": f"An unexpected error occurred during keyword extraction: {str(e)}"}
-    
-TASK_FUNCTIONS["extract_keywords"] = extract_keywords
-
-def evaluate_question_focus(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
-    question = task_params.get('question')
-    if not question:
-        logger.error("No question provided for focus evaluation.")
-        return {"error": "No question provided for focus evaluation."}
-
-    logger.debug(f"Evaluating focus of question: {question}")
-
-    # Construct prompt for LLM requesting JSON response
-    prompt = (
-        "Determine whether the following question is focused and detailed enough to be considered a single-topic question with an answer that can be a couple of concise sentences. "
-        "An example of a focused question is: What are recent NVIDIA AI products. "
-        "An example of a question which is not focused is: write a detailed report on recent advancements in the area of AI.\n\n"
-        "A focused question should be specific, clear, and centered around one main topic without multiple unrelated subtopics. "
-        "It should not be abstract but concrete and answerable.\n\n"
-        "Respond with a JSON object containing only a boolean field 'is_focused'.\n"
-        "{\n"
-        "  \"is_focused\": true\n"
-        "}\n\n"
-        f"Question:\n{question}\n\nIs this question focused and detailed on a single topic?"
-    )
-
-    try:
-        response = send_llm_request(
-            prompt,
-            cache,
-            EVALUATE_QUESTION_FOCUS_MODEL_NAME,
-            OLLAMA_URL,
-            expect_json=True  # Expecting a JSON response
-        )
-        # Validate and extract the 'is_focused' field from the JSON response
-        is_focused = response.get("is_focused")
-        if isinstance(is_focused, bool):
-            logger.debug(f"LLM determined 'is_focused': {is_focused}")
-            return {"is_focused": is_focused}
-        else:
-            logger.error(f"LLM response missing 'is_focused' field or invalid format: {response}")
-            return {"error": "Invalid LLM response format for question focus evaluation."}
-    except json.JSONDecodeError:
-        logger.exception("Failed to parse JSON response from LLM for question focus evaluation.")
-        return {"error": "Failed to parse JSON response from LLM."}
-    except Exception as e:
-        logger.exception("An error occurred during question focus evaluation.")
-        return {"error": f"An error occurred during question focus evaluation: {str(e)}"}
-
-TASK_FUNCTIONS["evaluate_question_focus"] = evaluate_question_focus
-
-def evaluate_summary(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
-    """
-    Evaluate whether a summary is valuable for inclusion in the final answer.
-
-    Args:
-        task_params (Dict[str, Any]): Parameters containing 'summary' and 'question'.
-        cache (Any): Optional cache parameter.
-
-    Returns:
-        Dict[str, Any]: Evaluation result indicating if the summary is valuable.
-    """
-    summary = task_params.get('summary')
-    question = task_params.get('question')
-    if not summary or not question:
-        logger.error("Both 'summary' and 'question' must be provided for summary evaluation.")
-        return {"error": "Both 'summary' and 'question' must be provided for summary evaluation."}
-
-    logger.debug(f"Evaluating summary: {summary} for question: {question}")
-
-    # Construct prompt for LLM requesting JSON response
-    prompt = (
-        "Determine whether the following summary is valuable for inclusion in the final answer to the given question. "
-        "A valuable summary should be relevant, concise, and provide clear insights that directly address the question. "
-        "An error message, a security warning, or a cookie policy is not valuable. "
-        "But news relevant to answering the question is.\n\n"
-        "Avoid summaries that are off-topic, too vague, or redundant.\n\n"
-        f"Question:\n{question}\n\nSummary:\n{summary}\n\n"
-        "Respond with a JSON object containing only a boolean field 'is_valuable'.\n"
-        "{\n"
-        "  \"is_valuable\": true\n"
-        "}"
-    )
-
-    try:
-        response = send_llm_request(
-            prompt,
-            cache,
-            EVALUATE_SUMMARY_MODEL_NAME,
-            OLLAMA_URL,
-            expect_json=True  # Expecting a JSON response
-        )
-        # Validate and extract the 'is_valuable' field from the JSON response
-        is_valuable = response.get("is_valuable")
-        if isinstance(is_valuable, bool):
-            logger.debug(f"LLM determined 'is_valuable' for summary: {is_valuable}")
-            return {"is_valuable": is_valuable}
-        else:
-            logger.error(f"LLM response missing 'is_valuable' field or invalid format: {response}")
-            return {"error": "Invalid LLM response format for summary evaluation."}
-    except json.JSONDecodeError:
-        logger.exception("Failed to parse JSON response from LLM for summary evaluation.")
-        return {"error": "Failed to parse JSON response from LLM."}
-    except Exception as e:
-        logger.exception("An error occurred during summary evaluation.")
-        return {"error": f"An error occurred during summary evaluation: {str(e)}"}
-
-TASK_FUNCTIONS["evaluate_summary"] = evaluate_summary
-
 # -------------------- Execute Task Function --------------------
 
 def execute_task(task_name: str, parameters: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     """
-    Execute a task by its name with the given parameters.
+    Execute a public task by its name with the given parameters.
+
+    Args:
+        task_name (str): The name of the task to execute.
+        parameters (Dict[str, Any]): Parameters required for the task.
+        cache (Any, optional): Optional cache object. Defaults to None.
+
+    Returns:
+        Dict[str, Any]: The outcome of the task, including any sub-task outcomes.
     """
-    task_function = TASK_FUNCTIONS.get(task_name)
+    task_function = TASK_FUNCTIONS_PUBLIC.get(task_name)
 
     # Log task_name and parameters to debug
     logger.debug(f"Executing task: {task_name}, with parameters: {parameters}")
