@@ -46,7 +46,7 @@ if not logger.handlers:
 OLLAMA_URL = "http://localhost:11434/api/generate"  # Replace with your actual endpoint
 ANSWER_GENERATION_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for answer generation
 CACHE_FILE = os.path.join("output", 'cache.db')
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 2
 MAX_DEPTH = 5
 
 # -------------------- Helper Functions --------------------

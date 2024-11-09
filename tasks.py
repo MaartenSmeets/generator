@@ -111,8 +111,8 @@ except OSError:
 # -------------------- Constants --------------------
 
 OLLAMA_URL = "http://localhost:11434/api/generate"  # Replace with your actual endpoint
-TASK_GENERATION_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for task generation
-SUMMARIZER_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable summarizer model name
+TASK_GENERATION_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable model name for task generation
+SUMMARIZER_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable summarizer model name
 IS_REPUTABLE_SOURCE_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Replace with your desired model name
 IS_CONTENT_VALUABLE_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable model name for content validation
 EVALUATE_QUESTION_FOCUS_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable model name for question focus evaluation
@@ -621,7 +621,7 @@ def is_reputable_source(task_params: Dict[str, Any], cache: Any = None) -> Dict[
     # Construct prompt for LLM enforcing JSON response
     description = (
         "Determine whether the following URL is from a reputable and credible source. "
-        "Consider international government sites, major tech companies like Microsoft, Apple, Nvidia, universities, "
+        "Consider international government sites, major tech companies like Meta, Google, OpenAI, Microsoft, Apple, Nvidia, universities, "
         "and reputable news outlets like BBC as reputable sources. Do not consider sources known for fake news like Fox News as reputable."
     )
     expected_keys = ["is_reputable"]
