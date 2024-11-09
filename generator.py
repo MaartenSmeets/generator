@@ -61,7 +61,7 @@ class TaskManager:
         self.conn = conn
         self.cache = cache
 
-    def process_task(self, task: Dict[str, Any], question_id: int, question_text: str) -> Dict[str, Any]:
+    def process_task(self, task: Dict[str, Any], question_id: Optional[int], question_text: str) -> Dict[str, Any]:
         task_name = task.get("name")
         parameters = task.get("parameters", {})
         logger.debug(f"Processing task '{task_name}' with parameters {parameters}")
@@ -98,7 +98,7 @@ class TaskManager:
         # Handle task-specific logic
         return self.handle_task_outcome(task_name, outcome, parameters, question_id, question_text)
 
-    def handle_task_outcome(self, task_name: str, outcome: Dict[str, Any], parameters: Dict[str, Any], question_id: int, question_text: str) -> Dict[str, Any]:
+    def handle_task_outcome(self, task_name: str, outcome: Dict[str, Any], parameters: Dict[str, Any], question_id: Optional[int], question_text: str) -> Dict[str, Any]:
         sub_task_outcomes = []
 
         if 'error' in outcome:
@@ -135,12 +135,12 @@ class TaskManager:
                         'error': extract_outcome['outcome']['error']
                     })
                     continue
-                structured_data = extract_outcome.get('outcome', {}).get('extracted_text')  # Assuming 'extracted_text' instead of 'structured_data'
-                if structured_data:
+                extracted_text = extract_outcome.get('outcome', {}).get('extracted_text')  # Assuming 'extracted_text' instead of 'structured_data'
+                if extracted_text:
                     # Summarize Text Task
                     summarize_task = {
                         'name': 'summarize_text',
-                        'parameters': {'text': structured_data, 'question': question_text}
+                        'parameters': {'text': extracted_text, 'question': question_text}
                     }
                     summary_outcome = self.process_task(summarize_task, question_id, question_text)
                     if 'error' in summary_outcome.get('outcome', {}):
@@ -167,7 +167,8 @@ class TaskManager:
                     if is_valuable:
                         sub_task_outcomes.append({
                             'url': url,
-                            'summary': summary
+                            'summary': summary,
+                            'valuable': True
                         })
                     else:
                         logger.debug(f"Summary deemed not valuable for URL: {url}")
@@ -207,8 +208,10 @@ class AnswerGenerator:
         logger.debug("Generating answer from context.")
         prompt = (
             "Based on the provided context, which includes the question, tasks with their parameters and outcomes, "
-            "and sub-answers, generate an answer to the question. Ensure all sources are verified and include concrete "
-            "URL references. Return ONLY valid JSON with one key: 'answer' (a string). No additional text or explanations.\n\n"
+            "and sub-answers, generate the best possible answer to the question, even if it is partial or incomplete. "
+            "Use any valuable information from the context to contribute to the answer. "
+            "Ensure all sources are verified and include concrete URL references where appropriate. "
+            "Return ONLY valid JSON with one key: 'answer' (a string). No additional text or explanations.\n\n"
             "Example:\n"
             "```json\n"
             "{\n"
@@ -236,10 +239,6 @@ class AnswerGenerator:
             logger.debug(f"Generated answer: {answer}")
             return answer
 
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON decoding failed: {e}")
-            logger.error(f"LLM response was: {response}")
-            return ""
         except Exception as e:
             logger.exception(f"An unexpected error occurred while generating answer from context: {e}")
             return ""
@@ -296,21 +295,16 @@ class QuestionProcessor:
 
         # If the maximum depth is reached, do not generate subquestions
         if current_depth >= MAX_DEPTH:
-            logger.debug(f"Maximum question depth {MAX_DEPTH} reached. Skipping subquestion generation.")
-            # Attempt to generate an answer directly
-            combined_context = {
-                'question': question_text,
-                'tasks': [],
-                'sub_answers': []
-            }
+            logger.debug(f"Maximum question depth {MAX_DEPTH} reached. Attempting to generate an answer directly.")
+            combined_context = self.collect_context(question_id)
             answer = self.answer_generator.generate_answer_from_context(combined_context)
             if answer:
                 # Validate if the answer indicates unanswerable
                 is_unanswerable = self.validate_answer(question_text, answer)
                 if is_unanswerable is None:
-                    logger.error("Failed to validate answer. Marking question as unanswerable.")
-                    database.update_question_status(self.conn, question_id, 'unanswerable')
-                    return None
+                    logger.error("Failed to validate answer. Proceeding with the available answer.")
+                    database.update_question_status(self.conn, question_id, 'answered', answer)
+                    return answer
                 elif is_unanswerable:
                     logger.info("Answer indicates the question is unanswerable.")
                     database.update_question_status(self.conn, question_id, 'unanswerable')
@@ -323,16 +317,25 @@ class QuestionProcessor:
             database.update_question_status(self.conn, question_id, 'unanswerable')
             return None
 
-        # Step 1: Extract keywords from the question
-        keywords = self.extract_keywords(question_id, question_text)
-        if keywords is None:
-            logger.error("Failed to extract keywords.")
-            database.update_question_status(self.conn, question_id, 'unanswerable')
-            return None
-        logger.debug(f"Extracted keywords: {keywords}")
+        # Step 1: Extract keywords from the question if not already done
+        if not database.has_task(self.conn, question_id, 'extract_keywords'):
+            keywords = self.extract_keywords(question_id, question_text)
+            if keywords is None:
+                logger.error("Failed to extract keywords.")
+                database.update_question_status(self.conn, question_id, 'unanswerable')
+                return None
+            logger.debug(f"Extracted keywords: {keywords}")
+        else:
+            # Fetch the outcome from the existing task
+            keywords = database.get_task_outcome(self.conn, question_id, 'extract_keywords').get('keywords', [])
+            logger.debug(f"Retrieved existing keywords: {keywords}")
 
         # Step 2: Evaluate if the question is focused
-        is_focused = self.evaluate_question_focus(question_id, question_text)
+        if not database.has_task(self.conn, question_id, 'evaluate_question_focus'):
+            is_focused = self.evaluate_question_focus(question_id, question_text)
+        else:
+            # Fetch the outcome from the existing task
+            is_focused = database.get_task_outcome(self.conn, question_id, 'evaluate_question_focus').get('is_focused', False)
         logger.debug(f"Is the question focused? {is_focused}")
 
         task_outcomes = []
@@ -348,20 +351,58 @@ class QuestionProcessor:
                 outcome = self.task_manager.process_task(task, question_id, question_text)
                 task_outcomes.append(outcome)
 
-            # Attempt to generate an answer from the context
-            combined_context = {
-                'question': question_text,
-                'tasks': task_outcomes,
-                'sub_answers': sub_answers
-            }
+            # Check if any summaries are valuable
+            any_valuable = any(
+                any(sub_task.get('valuable') for sub_task in outcome.get('sub_tasks', []))
+                for outcome in task_outcomes
+            )
+            logger.debug(f"Any valuable summaries found? {any_valuable}")
+
+            if not any_valuable:
+                # Treat question as not focused
+                logger.info("No valuable summaries found, reconsidering question focus.")
+                is_focused = False  # Update the flag to treat as not focused
+
+        if not is_focused:
+            logger.debug("Question is not focused. Generating subquestions.")
+
+            # Generate subquestions if not already done
+            if not database.has_task(self.conn, question_id, 'generate_subquestions'):
+                sub_questions = self.generate_subquestions(question_id, question_text)
+                logger.debug(f"Generated sub-questions: {sub_questions}")
+                # Save subquestions in the database
+                for sub_question_text in sub_questions:
+                    self.get_or_create_subquestion(sub_question_text, question_id)
+            else:
+                # Retrieve existing subquestions from the database
+                sub_questions = database.get_subquestions(self.conn, question_id)
+                logger.debug(f"Retrieved existing sub-questions: {sub_questions}")
+
+            # Process sub-questions
+            cursor.execute('SELECT id FROM Questions WHERE parent_id = ? AND status != ?', (question_id, 'answered'))
+            sub_question_ids = [row[0] for row in cursor.fetchall()]
+            for sub_question_id in sub_question_ids:
+                sub_answer = self.process_question(sub_question_id, attempts=attempts + 1)
+                if sub_answer:
+                    sub_answers.append(sub_answer)
+                else:
+                    # Retrieve sub-question text for logging
+                    cursor.execute('SELECT text FROM Questions WHERE id = ?', (sub_question_id,))
+                    sub_question_text = cursor.fetchone()[0]
+                    sub_answers.append(f"Could not find an answer to sub-question: {sub_question_text}")
+
+        else:
+            # Attempt to generate an answer from the context of focused tasks
+            combined_context = self.collect_context(question_id)
             answer = self.answer_generator.generate_answer_from_context(combined_context)
+            # After attempting to generate an answer
             if answer:
                 # Validate if the answer indicates unanswerable
-                is_unanswerable = self.validate_answer(question_text, answer)
+                is_unanswerable = self.validate_answer(question_id, question_text, answer)
                 if is_unanswerable is None:
-                    logger.error("Failed to validate answer. Marking question as unanswerable.")
-                    database.update_question_status(self.conn, question_id, 'unanswerable')
-                    return None
+                    logger.error("Failed to validate answer. Proceeding with the available answer.")
+                    database.update_question_status(self.conn, question_id, 'answered', answer)
+                    return answer
                 elif is_unanswerable:
                     logger.info("Answer indicates the question is unanswerable.")
                     database.update_question_status(self.conn, question_id, 'unanswerable')
@@ -369,38 +410,43 @@ class QuestionProcessor:
                 else:
                     database.update_question_status(self.conn, question_id, 'answered', answer)
                     return answer
-
+                
             logger.debug("Unable to generate answer from initial tasks, generating subquestions.")
-        else:
-            logger.debug("Question is not focused. Generating subquestions.")
-
-            # Generate subquestions
-            sub_questions = self.generate_subquestions(question_id, question_text)
-            logger.debug(f"Generated sub-questions: {sub_questions}")
+            # Generate subquestions if not already done
+            if not database.has_task(self.conn, question_id, 'generate_subquestions'):
+                sub_questions = self.generate_subquestions(question_id, question_text)
+                logger.debug(f"Generated sub-questions: {sub_questions}")
+                # Save subquestions in the database
+                for sub_question_text in sub_questions:
+                    self.get_or_create_subquestion(sub_question_text, question_id)
+            else:
+                # Retrieve existing subquestions from the database
+                sub_questions = database.get_subquestions(self.conn, question_id)
+                logger.debug(f"Retrieved existing sub-questions: {sub_questions}")
 
             # Process sub-questions
-            for sub_question_text in sub_questions:
-                sub_question_id = self.get_or_create_subquestion(sub_question_text, question_id)
+            cursor.execute('SELECT id FROM Questions WHERE parent_id = ? AND status != ?', (question_id, 'answered'))
+            sub_question_ids = [row[0] for row in cursor.fetchall()]
+            for sub_question_id in sub_question_ids:
                 sub_answer = self.process_question(sub_question_id, attempts=attempts + 1)
                 if sub_answer:
                     sub_answers.append(sub_answer)
                 else:
+                    # Retrieve sub-question text for logging
+                    cursor.execute('SELECT text FROM Questions WHERE id = ?', (sub_question_id,))
+                    sub_question_text = cursor.fetchone()[0]
                     sub_answers.append(f"Could not find an answer to sub-question: {sub_question_text}")
 
         # After processing tasks and/or subquestions, attempt to generate an answer using the collected information
-        combined_context = {
-            'question': question_text,
-            'tasks': task_outcomes,
-            'sub_answers': sub_answers
-        }
+        combined_context = self.collect_context(question_id)
         answer = self.answer_generator.generate_answer_from_context(combined_context)
         if answer:
             # Validate if the answer indicates unanswerable
             is_unanswerable = self.validate_answer(question_text, answer)
             if is_unanswerable is None:
-                logger.error("Failed to validate answer. Marking question as unanswerable.")
-                database.update_question_status(self.conn, question_id, 'unanswerable')
-                return None
+                logger.error("Failed to validate answer. Proceeding with the available answer.")
+                database.update_question_status(self.conn, question_id, 'answered', answer)
+                return answer
             elif is_unanswerable:
                 logger.info("Answer indicates the question is unanswerable.")
                 database.update_question_status(self.conn, question_id, 'unanswerable')
@@ -411,17 +457,29 @@ class QuestionProcessor:
         else:
             # Check for pending tasks or subquestions
             if not self.has_pending_tasks_or_subquestions(question_id):
-                logger.debug("No more pending tasks or subquestions, retrying.")
-                return self.process_question(question_id, attempts=attempts + 1)
+                if attempts < MAX_ATTEMPTS:
+                    logger.debug("No more pending tasks or subquestions, retrying.")
+                    return self.process_question(question_id, attempts=attempts + 1)
+                else:
+                    logger.warning(f"Max attempts reached for question ID {question_id}. Storing partial answer if any.")
+                    # Store any partial answers collected
+                    partial_answer = self.collect_partial_answers(question_id)
+                    if partial_answer:
+                        database.update_question_status(self.conn, question_id, 'answered', partial_answer)
+                        return partial_answer
+                    else:
+                        database.update_question_status(self.conn, question_id, 'unanswerable')
+                        return None
             else:
                 logger.debug("There are still pending tasks or subquestions.")
                 return None
 
-    def validate_answer(self, question: str, answer: str) -> Optional[bool]:
+    def validate_answer(self, question_id: int, question: str, answer: str) -> Optional[bool]:
         """
         Validates whether the generated answer indicates that the question is unanswerable.
 
         Args:
+            question_id (int): The ID of the question.
             question (str): The original question text.
             answer (str): The generated answer text.
 
@@ -432,13 +490,13 @@ class QuestionProcessor:
             "name": "validate_answer",
             "parameters": {"question": question, "answer": answer}
         }
-        outcome = self.task_manager.process_task(validation_task, question_id=None, question_text=question)
+        outcome = self.task_manager.process_task(validation_task, question_id=question_id, question_text=question)
         if 'error' in outcome.get('outcome', {}):
             logger.error(f"Error validating answer: {outcome['outcome']['error']}")
             return None
         is_unanswerable = outcome.get('outcome', {}).get('is_unanswerable', False)
         return is_unanswerable
-    
+
     def extract_keywords(self, question_id: int, question_text: str) -> Optional[List[str]]:
         keyword_task = {
             "name": "extract_keywords",
@@ -511,6 +569,79 @@ class QuestionProcessor:
 
         return pending_tasks_count > 0 or pending_subquestions_count > 0
 
+    def collect_context(self, question_id: int) -> Dict[str, Any]:
+        """
+        Collects context from tasks and sub-answers related to the question.
+
+        Args:
+            question_id (int): The ID of the question.
+
+        Returns:
+            Dict[str, Any]: A dictionary containing the context.
+        """
+        cursor = self.conn.cursor()
+
+        # Get the question text
+        cursor.execute('SELECT text FROM Questions WHERE id = ?', (question_id,))
+        question_text = cursor.fetchone()[0]
+
+        # Get tasks associated with the question
+        cursor.execute('SELECT task_type, parameters, outcome FROM Tasks WHERE question_id = ?', (question_id,))
+        tasks = []
+        for task_type, parameters_json, outcome_json in cursor.fetchall():
+            task = {
+                'task_name': task_type,
+                'parameters': json.loads(parameters_json),
+                'outcome': json.loads(outcome_json)
+            }
+            tasks.append(task)
+
+        # Get sub-answers from subquestions
+        cursor.execute('SELECT id FROM Questions WHERE parent_id = ?', (question_id,))
+        sub_question_ids = [row[0] for row in cursor.fetchall()]
+        sub_answers = []
+        for sub_id in sub_question_ids:
+            cursor.execute('SELECT status, answer FROM Questions WHERE id = ?', (sub_id,))
+            status, answer = cursor.fetchone()
+            if status == 'answered' and answer:
+                sub_answers.append(answer)
+
+        context = {
+            'question': question_text,
+            'tasks': tasks,
+            'sub_answers': sub_answers
+        }
+        return context
+
+    def collect_partial_answers(self, question_id: int) -> Optional[str]:
+        """
+        Collects partial answers from subquestions.
+
+        Args:
+            question_id (int): The ID of the question.
+
+        Returns:
+            Optional[str]: A combined partial answer if available.
+        """
+        cursor = self.conn.cursor()
+
+        # Get sub-answers from subquestions
+        cursor.execute('SELECT id FROM Questions WHERE parent_id = ?', (question_id,))
+        sub_question_ids = [row[0] for row in cursor.fetchall()]
+        sub_answers = []
+        for sub_id in sub_question_ids:
+            cursor.execute('SELECT status, answer FROM Questions WHERE id = ?', (sub_id,))
+            status, answer = cursor.fetchone()
+            if status == 'answered' and answer:
+                sub_answers.append(answer)
+
+        if sub_answers:
+            # Combine sub-answers into a partial answer
+            partial_answer = '\n\n'.join(sub_answers)
+            return partial_answer
+        else:
+            return None
+
 # -------------------- Main Execution Flow --------------------
 
 def main():
@@ -520,42 +651,46 @@ def main():
     # Open a persistent cache with shelve
     with load_cache(CACHE_FILE) as cache:
         try:
-            # Define the main question
-            question_text = """**Objective**: Create an elaborate complete markdown report detailing advancements in artificial intelligence only in November 2024, covering hardware, software, open-source developments and emerging trends (focus multiple large companies have shown recently) from reputable and credible sources. Ensure the report highlights recent trends and innovations that reflect the latest industry shifts and focus areas. Each statement should include online references to credible sources. Structure the report to appeal to a broad audience, including both technical and strategic stakeholders. Each section should be engaging, visual, and supported by concrete data from authoritative sources, preferably the official announcements, technical documentation, or product pages of the service providers or manufacturers.
-                **AI Hardware Advancements**: 
-                - Present major updates in AI-specific hardware, focusing on recent breakthroughs and trends:
-                    - Summarize upcoming releases or breakthroughs (e.g., new NVIDIA GPUs, Apple’s chips, advancements in edge AI hardware).
-                    - Provide performance comparisons to previous models to highlight improvements, efficiency gains, or scalability enhancements.
-                    - Include new use cases or efficiency gains expected from these advancements, and discuss how they reflect recent industry trends.
-                **Software Innovations**: 
-                - Outline cutting-edge software models and updates, including popular trends in AI applications:
-                    - Detail improvements in reasoning, multimodal capabilities, and efficiency with models like OpenAI’s GPT, Meta’s Llama, Google’s Gemini, and others that are driving new AI capabilities.
-                    - Emphasize recent developments in responsible AI, ethical AI practices, and any alignment improvements in popular models.
-                    - Include relevant benchmarks, unique features (such as increased context windows, enhanced image/video processing), and visual comparisons, highlighting recent improvements and trends.
-                **Open-Source Contributions**: 
-                - Showcase significant open-source AI releases, focusing on recent contributions and trends. Consider for example new open models and AI related frameworks. Consider LLMs and image generation models and other types when applicable.:
-                    - Highlight contributions from companies like Meta, Microsoft, Google, and others, explaining the anticipated impact and what is innovative about these tools.
-                    - Include real-world applications and potential impact, particularly in underrepresented regions or for solving specific societal challenges, showcasing the relevance to current global AI trends.
-                **Validation and Accuracy**: 
-                - Ensure all data points are accurate, verified, and from reputable sources. Avoid unverified claims by cross-referencing with multiple credible sources, primarily direct statements from the companies or technical documentation.
-            """
-            logger.info(f"Main question: {question_text}")
-
-            # Insert the main question into the database
-            main_question_id = database.insert_question(conn, question_text)
-
             # Initialize the question processor
             processor = QuestionProcessor(conn, cache)
 
-            # Process the main question
-            main_answer = processor.process_question(main_question_id)
+            # Check if there are any pending questions
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM Questions WHERE status != 'answered' AND status != 'unanswerable'")
+            pending_questions = cursor.fetchall()
 
-            if main_answer:
-                print(f"Answer to the main question: {main_answer}")
-                logger.info("Successfully obtained an answer to the main question.")
+            if pending_questions:
+                for (question_id,) in pending_questions:
+                    logger.info(f"Processing pending question ID: {question_id}")
+                    processor.process_question(question_id)
             else:
-                print("Could not find an answer to the main question.")
-                logger.warning("Failed to obtain an answer to the main question.")
+                # Define the main question
+                question_text = """**Objective**: Create an elaborate complete markdown report detailing advancements in artificial intelligence only in November 2024, covering hardware, software, open-source developments and emerging trends (focus multiple large companies have shown recently) from reputable and credible sources. Ensure the report highlights recent trends and innovations that reflect the latest industry shifts and focus areas. Each statement should include online references to credible sources. Structure the report to appeal to a broad audience, including both technical and strategic stakeholders. Each section should be engaging, visual, and supported by concrete data from authoritative sources, preferably the official announcements, technical documentation, or product pages of the service providers or manufacturers.
+                    **AI Hardware Advancements**: 
+                    - Present major updates in AI-specific hardware, focusing on recent breakthroughs and trends:
+                        - Summarize upcoming releases or breakthroughs (e.g., new NVIDIA GPUs, Apple’s chips, advancements in edge AI hardware).
+                        - Provide performance comparisons to previous models to highlight improvements, efficiency gains, or scalability enhancements.
+                        - Include new use cases or efficiency gains expected from these advancements, and discuss how they reflect recent industry trends.
+                    **Software Innovations**: 
+                    - Outline cutting-edge software models and updates, including popular trends in AI applications:
+                        - Detail improvements in reasoning, multimodal capabilities, and efficiency with models like OpenAI’s GPT, Meta’s Llama, Google’s Gemini, and others that are driving new AI capabilities.
+                        - Emphasize recent developments in responsible AI, ethical AI practices, and any alignment improvements in popular models.
+                        - Include relevant benchmarks, unique features (such as increased context windows, enhanced image/video processing), and visual comparisons, highlighting recent improvements and trends.
+                    **Open-Source Contributions**: 
+                    - Showcase significant open-source AI releases, focusing on recent contributions and trends. Consider for example new open models and AI related frameworks. Consider LLMs and image generation models and other types when applicable.:
+                        - Highlight contributions from companies like Meta, Microsoft, Google, and others, explaining the anticipated impact and what is innovative about these tools.
+                        - Include real-world applications and potential impact, particularly in underrepresented regions or for solving specific societal challenges, showcasing the relevance to current global AI trends.
+                    **Validation and Accuracy**: 
+                    - Ensure all data points are accurate, verified, and from reputable sources. Avoid unverified claims by cross-referencing with multiple credible sources, primarily direct statements from the companies or technical documentation.
+                """
+                logger.info(f"Main question: {question_text}")
+
+                # Insert the main question into the database
+                main_question_id = database.insert_question(conn, question_text)
+
+                # Process the main question
+                processor.process_question(main_question_id)
+
         except Exception as e:
             logger.exception("An error occurred during main execution.")
             print(f"An error occurred: {e}")

@@ -4,7 +4,7 @@ import sqlite3
 import json
 import os
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 # -------------------- Logging Configuration --------------------
 
@@ -93,7 +93,7 @@ def insert_question(conn: sqlite3.Connection, text: str, parent_id: Optional[int
     """
     cursor = conn.cursor()
     # Check if the question already exists
-    cursor.execute('SELECT id FROM Questions WHERE text = ? AND parent_id = ?', (text, parent_id))
+    cursor.execute('SELECT id FROM Questions WHERE text = ? AND parent_id IS ?', (text, parent_id))
     existing_question = cursor.fetchone()
     if existing_question:
         logger.debug(f"Question already exists with ID: {existing_question[0]}")
@@ -202,3 +202,71 @@ def get_existing_task_outcome(conn: sqlite3.Connection, task_type: str, paramete
         return outcome
     logger.debug("No existing task outcome found.")
     return None
+
+def has_task(conn: sqlite3.Connection, question_id: int, task_type: str) -> bool:
+    """
+    Check if a task of a specific type has been performed for a question.
+
+    Args:
+        conn (sqlite3.Connection): The database connection object.
+        question_id (int): The ID of the question.
+        task_type (str): The type/name of the task.
+
+    Returns:
+        bool: True if the task exists, False otherwise.
+    """
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id FROM Tasks WHERE question_id = ? AND task_type = ?
+    ''', (question_id, task_type))
+    existing_task = cursor.fetchone()
+    if existing_task:
+        logger.debug(f"Task '{task_type}' exists for question ID {question_id}.")
+        return True
+    else:
+        logger.debug(f"Task '{task_type}' does not exist for question ID {question_id}.")
+        return False
+
+def get_task_outcome(conn: sqlite3.Connection, question_id: int, task_type: str) -> Optional[Dict[str, Any]]:
+    """
+    Retrieve the outcome of a specific task for a question.
+
+    Args:
+        conn (sqlite3.Connection): The database connection object.
+        question_id (int): The ID of the question.
+        task_type (str): The type/name of the task.
+
+    Returns:
+        Optional[Dict[str, Any]]: The outcome of the task if found, else None.
+    """
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT outcome FROM Tasks
+        WHERE question_id = ? AND task_type = ? AND status = 'completed'
+    ''', (question_id, task_type))
+    row = cursor.fetchone()
+    if row and row[0]:
+        outcome = json.loads(row[0])
+        logger.debug(f"Retrieved outcome for task '{task_type}' for question ID {question_id}: {outcome}")
+        return outcome
+    logger.debug(f"No outcome found for task '{task_type}' for question ID {question_id}.")
+    return None
+
+def get_subquestions(conn: sqlite3.Connection, question_id: int) -> List[str]:
+    """
+    Retrieve the texts of subquestions for a given question ID.
+
+    Args:
+        conn (sqlite3.Connection): The database connection object.
+        question_id (int): The ID of the parent question.
+
+    Returns:
+        List[str]: A list of subquestion texts.
+    """
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT text FROM Questions WHERE parent_id = ?
+    ''', (question_id,))
+    subquestions = [row[0] for row in cursor.fetchall()]
+    logger.debug(f"Retrieved subquestions for question ID {question_id}: {subquestions}")
+    return subquestions

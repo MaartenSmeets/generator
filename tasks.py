@@ -111,14 +111,14 @@ except OSError:
 # -------------------- Constants --------------------
 
 OLLAMA_URL = "http://localhost:11434/api/generate"  # Replace with your actual endpoint
-TASK_GENERATION_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable model name for task generation
-SUMMARIZER_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable summarizer model name
+TASK_GENERATION_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for task generation
+SUMMARIZER_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable summarizer model name
 IS_REPUTABLE_SOURCE_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Replace with your desired model name
 IS_CONTENT_VALUABLE_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable model name for content validation
 EVALUATE_QUESTION_FOCUS_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable model name for question focus evaluation
 EVALUATE_SUMMARY_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable model name for summary evaluation
 VALIDATE_ANSWER_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable model name for answer validation
-GENERATE_SUBQUESTIONS_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable model name for subquestion generation
+GENERATE_SUBQUESTIONS_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for subquestion generation
 
 # -------------------- Helper Functions --------------------
 
@@ -854,11 +854,18 @@ def evaluate_question_focus(task_params: Dict[str, Any], cache: Any = None) -> D
 
     # Construct prompt for LLM enforcing JSON response
     description = (
-        "Determine whether the following question is focused and detailed enough to be considered a single-topic question with an answer that can be a couple of concise sentences. "
-        "An example of a focused question is: What are recent NVIDIA AI products. "
-        "An example of a question which is not focused is: write a detailed report on recent advancements in the area of AI.\n\n"
-        "A focused question should be specific, clear, and centered around one main topic without multiple unrelated subtopics. "
-        "It should be answerable with concrete and verifiable statements."
+        "Determine whether the following question is broad or specific. "
+        "A broad question often covers multiple topics or requires extensive explanation, "
+        "while a specific question is narrow and focused on a single topic that can be answered concisely. "
+        "If the question seems broad, consider it 'not focused'. Even if the question appears specific, "
+        "identify any underlying components that might require further decomposition into sub-questions.\n\n"
+        "Examples of focused questions:\n"
+        "- 'What are the latest NVIDIA AI products released in 2023?'\n"
+        "Examples of questions that are not focused:\n"
+        "- 'Write a detailed report on recent advancements in AI.'\n"
+        "- 'Explain everything about the AI industry.'\n\n"
+        "Return ONLY a JSON object with one key: 'is_focused' (a boolean). "
+        "Do not include any additional text, explanations, or code blocks. Ensure the JSON is properly formatted."
     )
     expected_keys = ["is_focused"]
     prompt = enforce_json_response(description, expected_keys) + f"\n\nQuestion:\n{question}"
@@ -872,11 +879,7 @@ def evaluate_question_focus(task_params: Dict[str, Any], cache: Any = None) -> D
             expect_json=True  # Expecting a JSON response
         )
         if response is None:
-            # Attempt to extract JSON from raw response
-            response_text = response if isinstance(response, str) else ""
-            response = extract_json_from_response(response_text)
-            if response is None:
-                return {"error": "Failed to extract JSON from LLM response."}
+            return {"error": "Failed to get response from LLM."}
 
         # Validate and extract the 'is_focused' field from the JSON response
         is_focused = response.get("is_focused")
@@ -886,13 +889,10 @@ def evaluate_question_focus(task_params: Dict[str, Any], cache: Any = None) -> D
         else:
             logger.error(f"LLM response missing 'is_focused' field or invalid format: {response}")
             return {"error": "Invalid LLM response format for question focus evaluation."}
-    except json.JSONDecodeError:
-        logger.exception("Failed to parse JSON response from LLM for question focus evaluation.")
-        return {"error": "Failed to parse JSON response from LLM."}
     except Exception as e:
         logger.exception("An error occurred during question focus evaluation.")
         return {"error": f"An error occurred during question focus evaluation: {str(e)}"}
-
+    
 def evaluate_summary(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     """
     Evaluate whether a summary is valuable for inclusion in the final answer.
@@ -971,7 +971,10 @@ def generate_subquestions(task_params: Dict[str, Any], cache: Any = None) -> Dic
 
     # Construct prompt for LLM enforcing JSON response with example
     description = (
-        "Please analyze the question below and decompose it into smaller, more specific sub-questions that can help in answering the main question comprehensively. "
+        "Please analyze the following question and decompose it into multiple smaller, specific sub-questions "
+        "that cover all aspects necessary to comprehensively answer the main question. "
+        "Even if the question seems focused, think about any underlying components or steps that need to be addressed. "
+        "Ensure that the combination of answers to these sub-questions will fully answer the main question.\n\n"
         "Return ONLY a JSON object with one key: 'subquestions', which is a list of strings. "
         "Do not include any additional text, explanations, or code blocks. Ensure the JSON is properly formatted."
     )
@@ -987,11 +990,7 @@ def generate_subquestions(task_params: Dict[str, Any], cache: Any = None) -> Dic
             expect_json=True  # Expecting a JSON response
         )
         if response is None:
-            # Attempt to extract JSON from raw response
-            response_text = response if isinstance(response, str) else ""
-            response = extract_json_from_response(response_text)
-            if response is None:
-                return {"error": "Failed to extract JSON from LLM response."}
+            return {"error": "Failed to get response from LLM."}
 
         sub_questions = response.get("subquestions", [])
         if not isinstance(sub_questions, list) or not all(isinstance(q, str) for q in sub_questions):
@@ -1002,13 +1001,10 @@ def generate_subquestions(task_params: Dict[str, Any], cache: Any = None) -> Dic
         else:
             logger.debug(f"Generated sub-questions: {sub_questions}")
         return {"subquestions": sub_questions}
-    except json.JSONDecodeError:
-        logger.exception("Failed to parse JSON response from LLM for subquestion generation.")
-        return {"error": "Failed to parse JSON response from LLM."}
     except Exception as e:
         logger.exception(f"Error generating subquestions: {e}")
         return {"error": f"An error occurred while generating subquestions: {str(e)}"}
-
+    
 def validate_answer(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     """
     Determine if the provided answer indicates that the question cannot be answered based on the supplied context.
@@ -1030,9 +1026,11 @@ def validate_answer(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
 
     # Construct prompt for LLM enforcing JSON response
     description = (
-        "Determine whether the following answer indicates that the question cannot be answered based on the supplied context. "
-        "Return ONLY a JSON object with one key: 'is_unanswerable' (a boolean). Do not include any additional text, explanations, or code blocks. "
-        "Ensure the JSON is properly formatted."
+        "Determine whether the following answer explicitly states that the question cannot be answered "
+        "based on the supplied context. If the answer provides any relevant information or partially answers the question, "
+        "even if not completely comprehensive, consider it answerable.\n\n"
+        "Return ONLY a JSON object with one key: 'is_unanswerable' (a boolean). "
+        "Do not include any additional text, explanations, or code blocks. Ensure the JSON is properly formatted."
     )
     expected_keys = ["is_unanswerable"]
     prompt = enforce_json_response(description, expected_keys) + f"\n\nQuestion:\n{question}\n\nAnswer:\n{answer}"
@@ -1046,12 +1044,7 @@ def validate_answer(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
             expect_json=True  # Expecting a JSON response
         )
         if response is None:
-            # Attempt to extract JSON from raw response
-            response_text = response if isinstance(response, str) else ""
-            response = extract_json_from_response(response_text)
-            if response is None:
-                logger.error("Failed to extract JSON from LLM response for answer validation.")
-                return {"error": "Failed to extract JSON from LLM response for answer validation."}
+            return {"error": "Failed to get response from LLM."}
 
         # Validate and extract the 'is_unanswerable' field from the JSON response
         is_unanswerable = response.get("is_unanswerable")
@@ -1061,13 +1054,10 @@ def validate_answer(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
         else:
             logger.error(f"LLM response missing 'is_unanswerable' field or invalid format: {response}")
             return {"error": "Invalid LLM response format for answer validation."}
-    except json.JSONDecodeError:
-        logger.exception("Failed to parse JSON response from LLM for answer validation.")
-        return {"error": "Failed to parse JSON response from LLM for answer validation."}
     except Exception as e:
         logger.exception("An error occurred during answer validation.")
         return {"error": f"An error occurred during answer validation: {str(e)}"}
-
+    
 # Register only public tasks
 for task in list_tasks():
     task_name = task["name"]
