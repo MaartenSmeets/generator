@@ -1,6 +1,9 @@
-# tasks.py
+"""
+tasks.py
 
-from typing import List, Dict, Any, Callable, Optional, Tuple
+This module contains various task definitions and helper functions for processing tasks.
+"""
+
 import json
 import logging
 import os
@@ -9,9 +12,12 @@ import re
 import subprocess
 import time
 import hashlib
+import random
+from typing import List, Dict, Any, Callable, Optional, Tuple
 from urllib.parse import urlparse
-import selenium
+
 import requests
+import selenium
 from bs4 import BeautifulSoup
 from lxml import html, etree
 import nltk
@@ -21,15 +27,26 @@ import spacy
 from PIL import Image
 import pytesseract
 from translate import Translator
-from selenium import webdriver
+import undetected_chromedriver as uc
+import numpy as np
+
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-import undetected_chromedriver as uc
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
+from selenium.webdriver.common.action_chains import ActionChains
+
+from youtube_transcript_api import (
+    YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
+)
+
+from llm_utils import send_llm_request
+from utils import (
+    get_som_labeled_img,
+    check_ocr_box,
+    get_caption_model_processor,
+    get_yolo_model,
+)
 
 from llm_utils import send_llm_request
 from utils import (
@@ -113,12 +130,12 @@ except OSError:
 OLLAMA_URL = "http://localhost:11434/api/generate"  # Replace with your actual endpoint
 TASK_GENERATION_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable model name for task generation
 SUMMARIZER_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable summarizer model name
-IS_REPUTABLE_SOURCE_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Replace with your desired model name
-IS_CONTENT_VALUABLE_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable model name for content validation
-EVALUATE_QUESTION_FOCUS_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable model name for question focus evaluation
-EVALUATE_SUMMARY_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable model name for summary evaluation
-VALIDATE_ANSWER_MODEL_NAME = "gemma2:9b-instruct-q8_0"  # Configurable model name for answer validation
-GENERATE_SUBQUESTIONS_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for subquestion generation
+IS_REPUTABLE_SOURCE_MODEL_NAME = "gemma2:9b-instruct-q8_0"
+IS_CONTENT_VALUABLE_MODEL_NAME = "gemma2:9b-instruct-q8_0"
+EVALUATE_QUESTION_FOCUS_MODEL_NAME = "gemma2:9b-instruct-q8_0"
+EVALUATE_SUMMARY_MODEL_NAME = "gemma2:9b-instruct-q8_0"
+VALIDATE_ANSWER_MODEL_NAME = "gemma2:9b-instruct-q8_0"
+GENERATE_SUBQUESTIONS_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"
 
 # -------------------- Helper Functions --------------------
 
@@ -127,14 +144,15 @@ def extract_json_from_response(response_text: str) -> Optional[Dict[str, Any]]:
     Extracts the first JSON object found in the response text.
     """
     try:
-        json_start = response_text.find('{')
-        json_end = response_text.rfind('}') + 1
-        if json_start == -1 or json_end == -1:
+        # Use regex to find JSON object
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
+            json_str = json_match.group()
+            parsed_json = json.loads(json_str)
+            return parsed_json
+        else:
             logger.error("No JSON object found in the response.")
             return None
-        json_str = response_text[json_start:json_end]
-        parsed_json = json.loads(json_str)
-        return parsed_json
     except json.JSONDecodeError as e:
         logger.exception(f"JSON decoding failed: {e}")
         return None
@@ -146,11 +164,15 @@ def enforce_json_response(description: str, expected_keys: List[str]) -> str:
     """
     Constructs a prompt that enforces the LLM to return a JSON response with specific keys.
     """
+    keys_str = ', '.join([f'"{key}"' for key in expected_keys])
+    example_content = ',\n  '.join([f'"{key}": "value"' for key in expected_keys])
     prompt = (
         f"{description}\n\n"
-        "Return ONLY a JSON object with the following keys: " + ", ".join([f"'{key}'" for key in expected_keys]) + ". "
-        "Do not include any additional text, explanations, or code blocks. "
-        "Ensure the JSON is properly formatted."
+        "Return ONLY valid JSON with the following keys:\n"
+        "{\n"
+        f"  {example_content}\n"
+        "}\n"
+        "Do not include any additional text or explanations. Ensure the JSON is properly formatted."
     )
     return prompt
 
@@ -670,7 +692,7 @@ def summarize_text(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, 
 
     prompt = (
         "Provide a summary of the following text, focusing especially on relevant details for answering the given question. "
-        "Be detailed and specific on suppliers, products, capabilities, dates and other key details such as strategy and vision.\n\n"
+        "Be detailed and specific on suppliers, products, capabilities, dates, and other key details such as strategy and vision.\n\n"
         "Do not include any introductions, comments about the summarization process, or closing remarks.\n\n"
         f"Question:\n{question}\n\nText:\n{text}\n\nSummary:"
     )
@@ -802,7 +824,7 @@ def parse_json(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]
 def extract_keywords(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
     text = task_params.get('text')
     logger.debug("Starting keyword extraction process.")
-    
+
     if not text:
         logger.error("No text provided for keyword extraction.")
         return {"error": "No text provided for keyword extraction."}
@@ -828,7 +850,7 @@ def extract_keywords(task_params: Dict[str, Any], cache: Any = None) -> Dict[str
     try:
         rake_nltk_var = Rake(language='english')
         logger.debug("Rake initialized successfully with language='english'. Extracting keywords from text.")
-        
+
         # Extract keywords
         rake_nltk_var.extract_keywords_from_text(text)
         keywords = rake_nltk_var.get_ranked_phrases()
@@ -854,18 +876,15 @@ def evaluate_question_focus(task_params: Dict[str, Any], cache: Any = None) -> D
 
     # Construct prompt for LLM enforcing JSON response
     description = (
-        "Determine whether the following question is broad or specific. "
-        "A broad question often covers multiple topics or requires extensive explanation, "
-        "while a specific question is narrow and focused on a single topic that can be answered concisely. "
-        "If the question seems broad, consider it 'not focused'. Even if the question appears specific, "
-        "identify any underlying components that might require further decomposition into sub-questions.\n\n"
-        "Examples of focused questions:\n"
-        "- 'What are the latest NVIDIA AI products released in 2023?'\n"
-        "Examples of questions that are not focused:\n"
-        "- 'Write a detailed report on recent advancements in AI.'\n"
-        "- 'Explain everything about the AI industry.'\n\n"
-        "Return ONLY a JSON object with one key: 'is_focused' (a boolean). "
-        "Do not include any additional text, explanations, or code blocks. Ensure the JSON is properly formatted."
+        "Determine whether the following question is focused or not focused. "
+        "A focused question is narrow and specific, and can be answered concisely. "
+        "An unfocused question is broad, covering multiple topics or requires extensive explanation.\n\n"
+        "If the question is focused, set 'is_focused' to true. If it is not focused, set 'is_focused' to false.\n"
+        "Return ONLY valid JSON with the following structure:\n"
+        "{\n"
+        '  "is_focused": true\n'
+        "}\n"
+        "Do not include any additional text or explanations. Ensure the JSON is properly formatted."
     )
     expected_keys = ["is_focused"]
     prompt = enforce_json_response(description, expected_keys) + f"\n\nQuestion:\n{question}"
@@ -892,34 +911,40 @@ def evaluate_question_focus(task_params: Dict[str, Any], cache: Any = None) -> D
     except Exception as e:
         logger.exception("An error occurred during question focus evaluation.")
         return {"error": f"An error occurred during question focus evaluation: {str(e)}"}
-    
+
 def evaluate_summary(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
-    """
-    Evaluate whether a summary is valuable for inclusion in the final answer.
-
-    Args:
-        task_params (Dict[str, Any]): Parameters containing 'summary' and 'question'.
-        cache (Any): Optional cache parameter.
-
-    Returns:
-        Dict[str, Any]: Evaluation result indicating if the summary is valuable.
-    """
     summary = task_params.get('summary')
     question = task_params.get('question')
     if not summary or not question:
         logger.error("Both 'summary' and 'question' must be provided for summary evaluation.")
         return {"error": "Both 'summary' and 'question' must be provided for summary evaluation."}
 
-    logger.debug(f"Evaluating summary: {summary} for question: {question}")
+    logger.debug(f"Evaluating summary for question: {question}")
 
     # Construct prompt for LLM enforcing JSON response
     description = (
         "Determine whether the following summary is valuable for inclusion in the context to help answer the given question. "
         "A valuable summary should provide clear insights that directly address the question. "
         "If the only information in the summary is an error message, a security warning, or a cookie policy, it is not valuable. "
-        "News relevant to answering the question is. When in doubt, consider it valuable."
+        "News relevant to answering the question is valuable. When in doubt, consider it valuable.\n\n"
+        "Return ONLY valid JSON with the following structure:\n"
+        "{\n"
+        '  "is_valuable": true\n'
+        "}\n"
+        "Set 'is_valuable' to true if the summary is valuable, or false if it is not. "
+        "Do not include any additional text or explanations. Ensure the JSON is properly formatted.\n\n"
+        "Examples:\n"
+        "Summary is valuable:\n"
+        "{\n"
+        '  "is_valuable": true\n'
+        "}\n"
+        "Summary is not valuable:\n"
+        "{\n"
+        '  "is_valuable": false\n'
+        "}"
     )
-    expected_keys = ["is_valuable"]
+
+    expected_keys = {"is_valuable": True}
     prompt = enforce_json_response(description, expected_keys) + f"\n\nQuestion:\n{question}\n\nSummary:\n{summary}"
 
     try:
@@ -931,54 +956,55 @@ def evaluate_summary(task_params: Dict[str, Any], cache: Any = None) -> Dict[str
             expect_json=True  # Expecting a JSON response
         )
         if response is None:
-            # Attempt to extract JSON from raw response
-            response_text = response if isinstance(response, str) else ""
-            response = extract_json_from_response(response_text)
-            if response is None:
-                return {"error": "Failed to extract JSON from LLM response."}
+            return {"error": "Failed to get response from LLM."}
 
         # Validate and extract the 'is_valuable' field from the JSON response
         is_valuable = response.get("is_valuable")
         if isinstance(is_valuable, bool):
-            logger.debug(f"LLM determined 'is_valuable' for summary: {is_valuable}")
+            logger.debug(f"LLM determined 'is_valuable': {is_valuable}")
+            return {"is_valuable": is_valuable}
+        elif isinstance(is_valuable, str):
+            if is_valuable.lower() == 'true':
+                is_valuable = True
+            elif is_valuable.lower() == 'false':
+                is_valuable = False
+            else:
+                logger.error(f"Invalid string value for 'is_valuable': {is_valuable}")
+                return {"error": "Invalid value for 'is_valuable'."}
+            logger.debug(f"LLM determined 'is_valuable' (from string): {is_valuable}")
             return {"is_valuable": is_valuable}
         else:
             logger.error(f"LLM response missing 'is_valuable' field or invalid format: {response}")
             return {"error": "Invalid LLM response format for summary evaluation."}
-    except json.JSONDecodeError:
-        logger.exception("Failed to parse JSON response from LLM for summary evaluation.")
-        return {"error": "Failed to parse JSON response from LLM."}
     except Exception as e:
         logger.exception("An error occurred during summary evaluation.")
         return {"error": f"An error occurred during summary evaluation: {str(e)}"}
 
 def generate_subquestions(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, Any]:
-    """
-    Generate subquestions based on the main question.
-
-    Args:
-        task_params (Dict[str, Any]): Parameters containing 'question'.
-        cache (Any): Optional cache parameter.
-
-    Returns:
-        Dict[str, Any]: Generated subquestions or error information.
-    """
     question = task_params.get('question')
     logger.debug("Generating subquestions.")
     if not question:
         logger.error("No question provided for subquestion generation.")
         return {"error": "No question provided for subquestion generation."}
 
-    # Construct prompt for LLM enforcing JSON response with example
     description = (
-        "Please analyze the following question and decompose it into multiple smaller, specific sub-questions "
+        "Analyze the following question and decompose it into multiple smaller, specific sub-questions "
         "that cover all aspects necessary to comprehensively answer the main question. "
-        "Even if the question seems focused, think about any underlying components or steps that need to be addressed. "
         "Ensure that the combination of answers to these sub-questions will fully answer the main question.\n\n"
-        "Return ONLY a JSON object with one key: 'subquestions', which is a list of strings. "
-        "Do not include any additional text, explanations, or code blocks. Ensure the JSON is properly formatted."
+        "Return ONLY a JSON object with one key: 'subquestions', which is a list of strings.\n"
+        "Do not include any additional text, explanations, or code blocks. Ensure the JSON is properly formatted.\n\n"
+        "Example:\n"
+        "{\n"
+        '  "subquestions": [\n'
+        '    "What are the latest advancements in AI hardware in November 2024?",\n'
+        '    "Which software models have been updated recently in AI?",\n'
+        '    "What significant open-source AI contributions have been made recently?",\n'
+        '    "How do these advancements reflect the latest industry trends and focus areas?"\n'
+        "  ]\n"
+        "}"
     )
-    expected_keys = ["subquestions"]
+
+    expected_keys = {"subquestions": ["List of subquestions as strings"]}
     prompt = enforce_json_response(description, expected_keys) + f"\n\nQuestion:\n{question}"
 
     try:
@@ -998,6 +1024,7 @@ def generate_subquestions(task_params: Dict[str, Any], cache: Any = None) -> Dic
             return {"error": "Subquestions are not in the expected format."}
         if not sub_questions:
             logger.error("Failed to generate sub-questions. The response was empty or improperly formatted.")
+            return {"error": "Failed to generate sub-questions."}
         else:
             logger.debug(f"Generated sub-questions: {sub_questions}")
         return {"subquestions": sub_questions}
@@ -1028,9 +1055,7 @@ def validate_answer(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
     description = (
         "Determine whether the following answer explicitly states that the question cannot be answered "
         "based on the supplied context. If the answer provides any relevant information or partially answers the question, "
-        "even if not completely comprehensive, consider it answerable.\n\n"
-        "Return ONLY a JSON object with one key: 'is_unanswerable' (a boolean). "
-        "Do not include any additional text, explanations, or code blocks. Ensure the JSON is properly formatted."
+        "even if not completely comprehensive, consider it answerable."
     )
     expected_keys = ["is_unanswerable"]
     prompt = enforce_json_response(description, expected_keys) + f"\n\nQuestion:\n{question}\n\nAnswer:\n{answer}"
@@ -1057,7 +1082,7 @@ def validate_answer(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
     except Exception as e:
         logger.exception("An error occurred during answer validation.")
         return {"error": f"An error occurred during answer validation: {str(e)}"}
-    
+
 # Register only public tasks
 for task in list_tasks():
     task_name = task["name"]
@@ -1085,11 +1110,11 @@ def _fetch_youtube_transcript(url: str) -> Dict[str, Any]:
         else:
             logger.error("Invalid YouTube URL format.")
             return {"error": "Invalid YouTube URL format."}
-        
+
         if not video_id:
             logger.error("Video ID not found in the URL.")
             return {"error": "Video ID not found in the URL."}
-        
+
         # Fetch the transcript using YouTubeTranscriptApi
         transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
         transcript_text = " ".join([entry['text'] for entry in transcript_list])
@@ -1325,7 +1350,7 @@ def _clean_som_output(output: list) -> str:
         str: Cleaned concatenated string with each entry on a new line.
     """
     cleaned_lines = []
-    
+
     # Process each item in the input list
     for item in output:
         # Check if item contains a colon and split if it does
@@ -1339,7 +1364,7 @@ def _clean_som_output(output: list) -> str:
         # Add to cleaned lines if not empty
         if cleaned_text:
             cleaned_lines.append(cleaned_text)
-    
+
     # Join all cleaned lines into a single string with newlines
     return "\n".join(cleaned_lines)
 
@@ -1347,9 +1372,7 @@ def _simulate_human_mouse_movement(driver, element):
     """
     Private helper function to simulate human-like mouse movement to interact with a web element.
     """
-    from selenium.webdriver.common.action_chains import ActionChains
-    import numpy as np
-    import random
+
 
     try:
         # Get the location and size of the element

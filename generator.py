@@ -5,7 +5,7 @@ import os
 import logging
 import shelve
 import sqlite3
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 import tasks  # Import the tasks module
 import database  # Import the new database module
 from llm_utils import send_llm_request
@@ -20,23 +20,23 @@ if not logger.handlers:
     # Define the output directory
     OUTPUT_DIR = "output"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
+
     # Define the path for the log file
     LOG_FILE = os.path.join(OUTPUT_DIR, 'generator.log')
-    
+
     # Create a file handler
     file_handler = logging.FileHandler(LOG_FILE)
     file_handler.setLevel(logging.DEBUG)
-    
+
     # Create a console handler
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.DEBUG)
-    
+
     # Define logging format
     formatter = logging.Formatter('%(asctime)s %(levelname)s:%(message)s')
     file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
-    
+
     # Add handlers to the logger
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
@@ -45,8 +45,9 @@ if not logger.handlers:
 
 OLLAMA_URL = "http://localhost:11434/api/generate"  # Replace with your actual endpoint
 ANSWER_GENERATION_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for answer generation
+GENERATE_SUBQUESTIONS_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # Configurable model name for subquestion generation
 CACHE_FILE = os.path.join("output", 'cache.db')
-MAX_ATTEMPTS = 2
+MAX_ATTEMPTS = 3  # Increased from 2 to 3
 MAX_DEPTH = 5
 
 # -------------------- Helper Functions --------------------
@@ -66,6 +67,9 @@ class TaskManager:
         parameters = task.get("parameters", {})
         logger.debug(f"Processing task '{task_name}' with parameters {parameters}")
 
+        # Ensure parameters are JSON-serializable
+        parameters = json.loads(json.dumps(parameters))
+
         # Add the question to the parameters if not already present
         parameters.setdefault('question', question_text)
 
@@ -83,16 +87,16 @@ class TaskManager:
             self.conn.commit()
         else:
             try:
+                # Insert the task as pending
+                task_id = database.insert_task(self.conn, question_id, task_name, parameters, status='pending', outcome={})
                 # Delegate task execution to tasks.py
                 outcome = tasks.execute_task(task_name, parameters, self.cache)
-                # Insert the task with the outcome
-                task_id = database.insert_task(self.conn, question_id, task_name, parameters, status='completed', outcome=outcome)
+                # Update the task with the outcome
                 database.update_task_status(self.conn, task_id, 'completed', outcome)
             except Exception as e:
                 logger.exception(f"Error executing task '{task_name}' with parameters {parameters}: {e}")
                 outcome = {'error': str(e)}
-                # Insert the task with the error
-                task_id = database.insert_task(self.conn, question_id, task_name, parameters, status='failed', outcome=outcome)
+                # Update the task with the error
                 database.update_task_status(self.conn, task_id, 'failed', outcome)
 
         # Handle task-specific logic
@@ -135,7 +139,7 @@ class TaskManager:
                         'error': extract_outcome['outcome']['error']
                     })
                     continue
-                extracted_text = extract_outcome.get('outcome', {}).get('extracted_text')  # Assuming 'extracted_text' instead of 'structured_data'
+                extracted_text = extract_outcome.get('outcome', {}).get('extracted_text')
                 if extracted_text:
                     # Summarize Text Task
                     summarize_task = {
@@ -204,22 +208,45 @@ class AnswerGenerator:
     def __init__(self, cache: shelve.Shelf):
         self.cache = cache
 
-    def generate_answer_from_context(self, context: Dict[str, Any]) -> str:
+    def generate_answer_from_context(self, question: str, context: Dict[str, Any]) -> Dict[str, Any]:
         logger.debug("Generating answer from context.")
+
+        # Build the context string from valuable summaries and sub-answers
+        context_strings = []
+
+        valuable_summaries = context.get('valuable_summaries', [])
+        if valuable_summaries:
+            context_strings.append("Valuable Summaries:")
+            for summary in valuable_summaries:
+                context_strings.append(f"- {summary}")
+
+        sub_answers = context.get('sub_answers', [])
+        if sub_answers:
+            context_strings.append("\nSub-Answers:")
+            for sub in sub_answers:
+                context_strings.append(f"Question: {sub['question']}\nAnswer: {sub['answer']}")
+
+        context_str = '\n'.join(context_strings)
+
         prompt = (
-            "Based on the provided context, which includes the question, tasks with their parameters and outcomes, "
-            "and sub-answers, generate the best possible answer to the question, even if it is partial or incomplete. "
-            "Use any valuable information from the context to contribute to the answer. "
-            "Ensure all sources are verified and include concrete URL references where appropriate. "
-            "Return ONLY valid JSON with one key: 'answer' (a string). No additional text or explanations.\n\n"
-            "Example:\n"
-            "```json\n"
+            "Using ONLY the provided context, generate a comprehensive and detailed answer to the question. "
+            "Do NOT include any information that is not present in the context. "
+            "Do NOT use any prior knowledge or data not included in the context. "
+            "If the context does not contain sufficient information to answer the question, state what information is missing in the 'missing_information' field. "
+            "Return ONLY valid JSON with two keys: 'answer' (a string) and 'missing_information' (a string explaining what is missing). "
+            "If the question is answerable, set 'missing_information' to an empty string. "
+            "Do not include any additional text or explanations.\n\n"
+            "Examples:\n"
             "{\n"
-            '  "answer": "Your generated answer here."\n'
+            '  "answer": "Your answer here.",\n'
+            '  "missing_information": ""\n'
             "}\n"
-            "```"
+            "{\n"
+            '  "answer": "",\n'
+            '  "missing_information": "The context lacks details about the latest AI hardware advancements."\n'
+            "}\n\n"
+            f"Question:\n{question}\n\nContext:\n{context_str}\n\nAnswer:"
         )
-        prompt += f"\nContext:\n{json.dumps(context, indent=2)}\n\nAnswer:"
 
         try:
             response = send_llm_request(
@@ -231,18 +258,20 @@ class AnswerGenerator:
             )
             logger.debug(f"LLM response for answer generation: {response}")
 
-            # Validate and extract the 'answer' field from the JSON response
+            # Validate and extract the 'answer' and 'missing_information' fields from the JSON response
             answer = response.get("answer", "")
-            if not isinstance(answer, str):
-                logger.error("The 'answer' field is missing or not a string in the JSON response.")
-                return ""
+            missing_information = response.get("missing_information", "")
+            if not isinstance(answer, str) or not isinstance(missing_information, str):
+                logger.error("The 'answer' or 'missing_information' field is missing or not a string in the JSON response.")
+                return {}
             logger.debug(f"Generated answer: {answer}")
-            return answer
+            logger.debug(f"Missing information: {missing_information}")
+            return {"answer": answer, "missing_information": missing_information}
 
         except Exception as e:
             logger.exception(f"An unexpected error occurred while generating answer from context: {e}")
-            return ""
-
+            return {}
+        
 class QuestionProcessor:
     def __init__(self, conn: sqlite3.Connection, cache: shelve.Shelf):
         self.conn = conn
@@ -266,6 +295,59 @@ class QuestionProcessor:
             depth += 1
             current_id = row[0]
         return depth
+
+    def generate_subquestions_from_missing_information(self, question_id: int, missing_information: str) -> List[str]:
+        """
+        Generate subquestions based on the missing information.
+
+        Args:
+            question_id (int): The ID of the question.
+            missing_information (str): The information that is missing to answer the question.
+
+        Returns:
+            List[str]: A list of generated subquestions.
+        """
+        logger.debug(f"Generating subquestions from missing information: {missing_information}")
+
+        # Fetch the main question text from the database
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT text FROM Questions WHERE id = ?', (question_id,))
+        question_row = cursor.fetchone()
+        if not question_row:
+            logger.error(f"Question ID {question_id} not found.")
+            return []
+        question_text = question_row[0]
+
+        # Construct prompt for LLM enforcing JSON response
+        description = (
+            "Based on the following missing information and the main question, generate specific sub-questions that, when answered, "
+            "will provide the necessary information to answer the main question."
+            "Ensure that the combination of answers to these sub-questions will fully address the missing information."
+        )
+        expected_keys = {"subquestions": ["List of subquestions as strings"]}
+        prompt = tasks.enforce_json_response(description, expected_keys) + f"\n\nMain Question:\n{question_text}\n\nMissing Information:\n{missing_information}"
+
+        try:
+            response = send_llm_request(
+                prompt,
+                self.cache,
+                GENERATE_SUBQUESTIONS_MODEL_NAME,
+                OLLAMA_URL,
+                expect_json=True  # Expecting a JSON response
+            )
+            if response is None:
+                logger.error("Failed to get response from LLM when generating subquestions from missing information.")
+                return []
+
+            sub_questions = response.get("subquestions", [])
+            if not isinstance(sub_questions, list) or not all(isinstance(q, str) for q in sub_questions):
+                logger.error("Subquestions are not in the expected format when generated from missing information.")
+                return []
+            logger.debug(f"Generated sub-questions from missing information: {sub_questions}")
+            return sub_questions
+        except Exception as e:
+            logger.exception(f"Error generating subquestions from missing information: {e}")
+            return []
 
     def process_question(self, question_id: int, attempts: int = 0) -> Optional[str]:
         cursor = self.conn.cursor()
@@ -297,10 +379,10 @@ class QuestionProcessor:
         if current_depth >= MAX_DEPTH:
             logger.debug(f"Maximum question depth {MAX_DEPTH} reached. Attempting to generate an answer directly.")
             combined_context = self.collect_context(question_id)
-            answer = self.answer_generator.generate_answer_from_context(combined_context)
+            answer = self.answer_generator.generate_answer_from_context(question_text, combined_context)
             if answer:
                 # Validate if the answer indicates unanswerable
-                is_unanswerable = self.validate_answer(question_text, answer)
+                is_unanswerable = self.validate_answer(question_id, question_text, answer)
                 if is_unanswerable is None:
                     logger.error("Failed to validate answer. Proceeding with the available answer.")
                     database.update_question_status(self.conn, question_id, 'answered', answer)
@@ -379,7 +461,7 @@ class QuestionProcessor:
                 logger.debug(f"Retrieved existing sub-questions: {sub_questions}")
 
             # Process sub-questions
-            cursor.execute('SELECT id FROM Questions WHERE parent_id = ? AND status != ?', (question_id, 'answered'))
+            cursor.execute('SELECT id FROM Questions WHERE parent_id = ?', (question_id,))
             sub_question_ids = [row[0] for row in cursor.fetchall()]
             for sub_question_id in sub_question_ids:
                 sub_answer = self.process_question(sub_question_id, attempts=attempts + 1)
@@ -394,7 +476,7 @@ class QuestionProcessor:
         else:
             # Attempt to generate an answer from the context of focused tasks
             combined_context = self.collect_context(question_id)
-            answer = self.answer_generator.generate_answer_from_context(combined_context)
+            answer = self.answer_generator.generate_answer_from_context(question_text, combined_context)
             # After attempting to generate an answer
             if answer:
                 # Validate if the answer indicates unanswerable
@@ -410,7 +492,7 @@ class QuestionProcessor:
                 else:
                     database.update_question_status(self.conn, question_id, 'answered', answer)
                     return answer
-                
+
             logger.debug("Unable to generate answer from initial tasks, generating subquestions.")
             # Generate subquestions if not already done
             if not database.has_task(self.conn, question_id, 'generate_subquestions'):
@@ -425,7 +507,7 @@ class QuestionProcessor:
                 logger.debug(f"Retrieved existing sub-questions: {sub_questions}")
 
             # Process sub-questions
-            cursor.execute('SELECT id FROM Questions WHERE parent_id = ? AND status != ?', (question_id, 'answered'))
+            cursor.execute('SELECT id FROM Questions WHERE parent_id = ?', (question_id,))
             sub_question_ids = [row[0] for row in cursor.fetchall()]
             for sub_question_id in sub_question_ids:
                 sub_answer = self.process_question(sub_question_id, attempts=attempts + 1)
@@ -437,42 +519,62 @@ class QuestionProcessor:
                     sub_question_text = cursor.fetchone()[0]
                     sub_answers.append(f"Could not find an answer to sub-question: {sub_question_text}")
 
-        # After processing tasks and/or subquestions, attempt to generate an answer using the collected information
-        combined_context = self.collect_context(question_id)
-        answer = self.answer_generator.generate_answer_from_context(combined_context)
-        if answer:
-            # Validate if the answer indicates unanswerable
-            is_unanswerable = self.validate_answer(question_text, answer)
-            if is_unanswerable is None:
-                logger.error("Failed to validate answer. Proceeding with the available answer.")
-                database.update_question_status(self.conn, question_id, 'answered', answer)
-                return answer
-            elif is_unanswerable:
-                logger.info("Answer indicates the question is unanswerable.")
-                database.update_question_status(self.conn, question_id, 'unanswerable')
-                return None
-            else:
-                database.update_question_status(self.conn, question_id, 'answered', answer)
-                return answer
-        else:
-            # Check for pending tasks or subquestions
-            if not self.has_pending_tasks_or_subquestions(question_id):
-                if attempts < MAX_ATTEMPTS:
-                    logger.debug("No more pending tasks or subquestions, retrying.")
-                    return self.process_question(question_id, attempts=attempts + 1)
-                else:
-                    logger.warning(f"Max attempts reached for question ID {question_id}. Storing partial answer if any.")
-                    # Store any partial answers collected
-                    partial_answer = self.collect_partial_answers(question_id)
-                    if partial_answer:
-                        database.update_question_status(self.conn, question_id, 'answered', partial_answer)
-                        return partial_answer
+                # After processing tasks and/or subquestions, attempt to generate an answer using the collected information
+                combined_context = self.collect_context(question_id)
+                answer_result = self.answer_generator.generate_answer_from_context(question_text, combined_context)
+
+                if answer_result:
+                    answer_text = answer_result.get('answer', '')
+                    missing_information = answer_result.get('missing_information', '')
+                    if missing_information:
+                        # Generate subquestions based on missing information
+                        logger.info(f"Missing information identified: {missing_information}")
+                        # Use missing_information to generate subquestions
+                        sub_questions = self.generate_subquestions_from_missing_information(question_id, missing_information)
+                        # Save subquestions in the database
+                        for sub_question_text in sub_questions:
+                            self.get_or_create_subquestion(sub_question_text, question_id)
+                        # Re-process the question after adding subquestions
+                        return self.process_question(question_id, attempts=attempts + 1)
+                    elif answer_text:
+                        # Validate if the answer indicates unanswerable
+                        is_unanswerable = self.validate_answer(question_id, question_text, answer_text)
+                        if is_unanswerable is None:
+                            logger.error("Failed to validate answer. Proceeding with the available answer.")
+                            database.update_question_status(self.conn, question_id, 'answered', answer_text)
+                            return answer_text
+                        elif is_unanswerable:
+                            logger.info("Answer indicates the question is unanswerable.")
+                            database.update_question_status(self.conn, question_id, 'unanswerable')
+                            return None
+                        else:
+                            database.update_question_status(self.conn, question_id, 'answered', answer_text)
+                            return answer_text
                     else:
+                        # Handle the case where both answer and missing_information are empty
+                        logger.info("No answer or missing information provided. Marking question as unanswerable.")
                         database.update_question_status(self.conn, question_id, 'unanswerable')
                         return None
             else:
-                logger.debug("There are still pending tasks or subquestions.")
-                return None
+                # Handle the case where answer generation failed
+                # Check for pending tasks or subquestions
+                if not self.has_pending_tasks_or_subquestions(question_id):
+                    if attempts < MAX_ATTEMPTS:
+                        logger.debug("No more pending tasks or subquestions, retrying.")
+                        return self.process_question(question_id, attempts=attempts + 1)
+                    else:
+                        logger.warning(f"Max attempts reached for question ID {question_id}. Storing partial answer if any.")
+                        # Store any partial answers collected
+                        partial_answer = self.collect_partial_answers(question_id)
+                        if partial_answer:
+                            database.update_question_status(self.conn, question_id, 'answered', partial_answer)
+                            return partial_answer
+                        else:
+                            database.update_question_status(self.conn, question_id, 'unanswerable')
+                            return None
+                else:
+                    logger.debug("There are still pending tasks or subquestions.")
+                    return None
 
     def validate_answer(self, question_id: int, question: str, answer: str) -> Optional[bool]:
         """
@@ -569,9 +671,72 @@ class QuestionProcessor:
 
         return pending_tasks_count > 0 or pending_subquestions_count > 0
 
+    def collect_valuable_summaries(self, question_id: int) -> List[str]:
+        """
+        Recursively collects valuable summaries for a question and its subquestions.
+
+        Args:
+            question_id (int): The ID of the question.
+
+        Returns:
+            List[str]: A list of valuable summaries as strings.
+        """
+        cursor = self.conn.cursor()
+
+        # Collect valuable summaries for the question
+        cursor.execute('''
+            SELECT S.outcome
+            FROM Tasks S
+            JOIN Tasks E ON S.question_id = E.question_id AND S.parameters = E.parameters
+            WHERE S.task_type = 'summarize_text'
+            AND E.task_type = 'evaluate_summary'
+            AND S.question_id = ?
+            AND E.status = 'completed'
+            AND json_extract(E.outcome, '$.is_valuable') = 1
+        ''', (question_id,))
+        valuable_summaries = []
+        for row in cursor.fetchall():
+            outcome = json.loads(row[0])
+            summary = outcome.get('summary', '')
+            if summary:
+                valuable_summaries.append(summary)
+
+        # Recursively collect valuable summaries from subquestions
+        cursor.execute('SELECT id FROM Questions WHERE parent_id = ?', (question_id,))
+        sub_question_ids = [row[0] for row in cursor.fetchall()]
+        for sub_question_id in sub_question_ids:
+            valuable_summaries.extend(self.collect_valuable_summaries(sub_question_id))
+
+        return valuable_summaries
+    
+    def collect_sub_answers(self, question_id: int) -> List[Dict[str, Any]]:
+        """
+        Recursively collects sub-answers from subquestions.
+
+        Args:
+            question_id (int): The ID of the question.
+
+        Returns:
+            List[Dict[str, Any]]: A list of sub-answers.
+        """
+        cursor = self.conn.cursor()
+        sub_answers = []
+
+        cursor.execute('SELECT id, text FROM Questions WHERE parent_id = ?', (question_id,))
+        sub_questions = cursor.fetchall()
+        for sub_id, sub_question_text in sub_questions:
+            cursor.execute('SELECT status, answer FROM Questions WHERE id = ?', (sub_id,))
+            status, answer = cursor.fetchone()
+            if status == 'answered' and answer:
+                sub_answers.append({'question': sub_question_text, 'answer': answer})
+            # Recursively collect sub_answers from deeper levels
+            sub_answers.extend(self.collect_sub_answers(sub_id))
+
+        return sub_answers
+
     def collect_context(self, question_id: int) -> Dict[str, Any]:
         """
-        Collects context from tasks and sub-answers related to the question.
+        Collects context from valuable summaries and sub-answers related to the question.
 
         Args:
             question_id (int): The ID of the question.
@@ -579,36 +744,10 @@ class QuestionProcessor:
         Returns:
             Dict[str, Any]: A dictionary containing the context.
         """
-        cursor = self.conn.cursor()
-
-        # Get the question text
-        cursor.execute('SELECT text FROM Questions WHERE id = ?', (question_id,))
-        question_text = cursor.fetchone()[0]
-
-        # Get tasks associated with the question
-        cursor.execute('SELECT task_type, parameters, outcome FROM Tasks WHERE question_id = ?', (question_id,))
-        tasks = []
-        for task_type, parameters_json, outcome_json in cursor.fetchall():
-            task = {
-                'task_name': task_type,
-                'parameters': json.loads(parameters_json),
-                'outcome': json.loads(outcome_json)
-            }
-            tasks.append(task)
-
-        # Get sub-answers from subquestions
-        cursor.execute('SELECT id FROM Questions WHERE parent_id = ?', (question_id,))
-        sub_question_ids = [row[0] for row in cursor.fetchall()]
-        sub_answers = []
-        for sub_id in sub_question_ids:
-            cursor.execute('SELECT status, answer FROM Questions WHERE id = ?', (sub_id,))
-            status, answer = cursor.fetchone()
-            if status == 'answered' and answer:
-                sub_answers.append(answer)
-
+        valuable_summaries = self.collect_valuable_summaries(question_id)
+        sub_answers = self.collect_sub_answers(question_id)
         context = {
-            'question': question_text,
-            'tasks': tasks,
+            'valuable_summaries': valuable_summaries,
             'sub_answers': sub_answers
         }
         return context
