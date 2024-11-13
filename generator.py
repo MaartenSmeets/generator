@@ -230,16 +230,20 @@ class AnswerGenerator:
 
         prompt = (
             "Using ONLY the provided context, generate a comprehensive and detailed answer to the question. "
-            "Do NOT include any information that is not present in the context. "
             "Do NOT use any prior knowledge or data not included in the context. "
-            "If the context does not contain sufficient information to answer the question, state what information is missing in the 'missing_information' field. "
+            "If the context contains enough information for a partial but incomplete answer, provide the partial answer in the 'answer' field and explain what additional information is missing in the 'missing_information' field. "
+            "If the context does not contain sufficient information to answer the question at all, set 'answer' to an empty string and describe in detail what specific information is missing in 'missing_information'. "
             "Return ONLY valid JSON with two keys: 'answer' (a string) and 'missing_information' (a string explaining what is missing). "
-            "If the question is answerable, set 'missing_information' to an empty string. "
+            "If the question is fully answerable, set 'missing_information' to an empty string. "
             "Do not include any additional text or explanations.\n\n"
             "Examples:\n"
             "{\n"
             '  "answer": "Your answer here.",\n'
             '  "missing_information": ""\n'
+            "}\n"
+            "{\n"
+            '  "answer": "Partial answer here.",\n'
+            '  "missing_information": "The context lacks specific details about the implementation steps."\n'
             "}\n"
             "{\n"
             '  "answer": "",\n'
@@ -271,7 +275,7 @@ class AnswerGenerator:
         except Exception as e:
             logger.exception(f"An unexpected error occurred while generating answer from context: {e}")
             return {}
-        
+
 class QuestionProcessor:
     def __init__(self, conn: sqlite3.Connection, cache: shelve.Shelf):
         self.conn = conn
@@ -379,21 +383,23 @@ class QuestionProcessor:
         if current_depth >= MAX_DEPTH:
             logger.debug(f"Maximum question depth {MAX_DEPTH} reached. Attempting to generate an answer directly.")
             combined_context = self.collect_context(question_id)
-            answer = self.answer_generator.generate_answer_from_context(question_text, combined_context)
-            if answer:
+            answer_result = self.answer_generator.generate_answer_from_context(question_text, combined_context)
+            if answer_result:
+                answer_text = answer_result.get('answer', '')
+                missing_information = answer_result.get('missing_information', '')
                 # Validate if the answer indicates unanswerable
-                is_unanswerable = self.validate_answer(question_id, question_text, answer)
+                is_unanswerable = self.validate_answer(question_id, question_text, answer_text)
                 if is_unanswerable is None:
                     logger.error("Failed to validate answer. Proceeding with the available answer.")
-                    database.update_question_status(self.conn, question_id, 'answered', answer)
-                    return answer
+                    database.update_question_status(self.conn, question_id, 'answered', answer_text)
+                    return answer_text
                 elif is_unanswerable:
                     logger.info("Answer indicates the question is unanswerable.")
                     database.update_question_status(self.conn, question_id, 'unanswerable')
                     return None
                 else:
-                    database.update_question_status(self.conn, question_id, 'answered', answer)
-                    return answer
+                    database.update_question_status(self.conn, question_id, 'answered', answer_text)
+                    return answer_text
 
             logger.debug("Unable to generate answer at maximum depth.")
             database.update_question_status(self.conn, question_id, 'unanswerable')
@@ -476,22 +482,41 @@ class QuestionProcessor:
         else:
             # Attempt to generate an answer from the context of focused tasks
             combined_context = self.collect_context(question_id)
-            answer = self.answer_generator.generate_answer_from_context(question_text, combined_context)
+            answer_result = self.answer_generator.generate_answer_from_context(question_text, combined_context)
             # After attempting to generate an answer
-            if answer:
-                # Validate if the answer indicates unanswerable
-                is_unanswerable = self.validate_answer(question_id, question_text, answer)
-                if is_unanswerable is None:
-                    logger.error("Failed to validate answer. Proceeding with the available answer.")
-                    database.update_question_status(self.conn, question_id, 'answered', answer)
-                    return answer
-                elif is_unanswerable:
-                    logger.info("Answer indicates the question is unanswerable.")
+            if answer_result:
+                answer_text = answer_result.get('answer', '')
+                missing_information = answer_result.get('missing_information', '')
+
+                if not answer_text and missing_information:
+                    # Generate subquestions based on missing information
+                    logger.info(f"Missing information identified: {missing_information}")
+                    # Use missing_information to generate subquestions
+                    sub_questions = self.generate_subquestions_from_missing_information(question_id, missing_information)
+                    # Save subquestions in the database
+                    for sub_question_text in sub_questions:
+                        self.get_or_create_subquestion(sub_question_text, question_id)
+                    # Re-process the question after adding subquestions
+                    return self.process_question(question_id, attempts=attempts + 1)
+                elif not answer_text and not missing_information:
+                    # Handle the case where both answer and missing_information are empty
+                    logger.info("No answer or missing information provided. Marking question as unanswerable.")
                     database.update_question_status(self.conn, question_id, 'unanswerable')
                     return None
                 else:
-                    database.update_question_status(self.conn, question_id, 'answered', answer)
-                    return answer
+                    # Validate if the answer indicates unanswerable
+                    is_unanswerable = self.validate_answer(question_id, question_text, answer_text)
+                    if is_unanswerable is None:
+                        logger.error("Failed to validate answer. Proceeding with the available answer.")
+                        database.update_question_status(self.conn, question_id, 'answered', answer_text)
+                        return answer_text
+                    elif is_unanswerable:
+                        logger.info("Answer indicates the question is unanswerable.")
+                        database.update_question_status(self.conn, question_id, 'unanswerable')
+                        return None
+                    else:
+                        database.update_question_status(self.conn, question_id, 'answered', answer_text)
+                        return answer_text
 
             logger.debug("Unable to generate answer from initial tasks, generating subquestions.")
             # Generate subquestions if not already done
@@ -708,7 +733,7 @@ class QuestionProcessor:
             valuable_summaries.extend(self.collect_valuable_summaries(sub_question_id))
 
         return valuable_summaries
-    
+
     def collect_sub_answers(self, question_id: int) -> List[Dict[str, Any]]:
         """
         Recursively collects sub-answers from subquestions.

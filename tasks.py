@@ -35,17 +35,10 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.action_chains import ActionChains
+import chromedriver_autoinstaller
 
 from youtube_transcript_api import (
     YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
-)
-
-from llm_utils import send_llm_request
-from utils import (
-    get_som_labeled_img,
-    check_ocr_box,
-    get_caption_model_processor,
-    get_yolo_model,
 )
 
 from llm_utils import send_llm_request
@@ -1047,7 +1040,8 @@ def validate_answer(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
     answer = task_params.get('answer')
     logger.debug(f"Validating if answer indicates unanswerable for question: {question}")
 
-    if not question or not answer:
+    # Allow empty strings for 'answer', but check for None
+    if question is None or answer is None:
         logger.error("Both 'question' and 'answer' must be provided for answer validation.")
         return {"error": "Both 'question' and 'answer' must be provided for answer validation."}
 
@@ -1055,7 +1049,8 @@ def validate_answer(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
     description = (
         "Determine whether the following answer explicitly states that the question cannot be answered "
         "based on the supplied context. If the answer provides any relevant information or partially answers the question, "
-        "even if not completely comprehensive, consider it answerable."
+        "even if not completely comprehensive, consider it answerable. "
+        "If the answer is empty or does not provide any information, consider it unanswerable."
     )
     expected_keys = ["is_unanswerable"]
     prompt = enforce_json_response(description, expected_keys) + f"\n\nQuestion:\n{question}\n\nAnswer:\n{answer}"
@@ -1075,6 +1070,16 @@ def validate_answer(task_params: Dict[str, Any], cache: Any = None) -> Dict[str,
         is_unanswerable = response.get("is_unanswerable")
         if isinstance(is_unanswerable, bool):
             logger.debug(f"LLM determined 'is_unanswerable': {is_unanswerable}")
+            return {"is_unanswerable": is_unanswerable}
+        elif isinstance(is_unanswerable, str):
+            if is_unanswerable.lower() == 'true':
+                is_unanswerable = True
+            elif is_unanswerable.lower() == 'false':
+                is_unanswerable = False
+            else:
+                logger.error(f"Invalid string value for 'is_unanswerable': {is_unanswerable}")
+                return {"error": "Invalid value for 'is_unanswerable'."}
+            logger.debug(f"LLM determined 'is_unanswerable' (from string): {is_unanswerable}")
             return {"is_unanswerable": is_unanswerable}
         else:
             logger.error(f"LLM response missing 'is_unanswerable' field or invalid format: {response}")
@@ -1188,13 +1193,18 @@ def _capture_screenshot(url: str, max_retries: int = 3, delay: int = 5) -> Optio
     chrome_options.add_argument("--disable-infobars")
     chrome_options.add_argument("--start-maximized")
     chrome_options.add_argument("--ignore-certificate-errors")
+    chrome_options.add_argument("--host-resolver-rules='MAP * ~NOTFOUND , EXCLUDE localhost'")
+    chrome_options.add_argument("--dns-prefetch-disable")
+    chrome_options.add_argument("--disable-async-dns")
 
-    # Initialize the undetected Chrome WebDriver with use_subprocess=True
+    # Install the ChromeDriver matching the installed Chrome version
+    chromedriver_path = chromedriver_autoinstaller.install()
+    logger.debug(f"Using ChromeDriver at {chromedriver_path}")
+
     try:
-        logger.debug("Initializing undetected_chromedriver with subprocess.")
-        driver = uc.Chrome(options=chrome_options, use_subprocess=True)
+        driver = uc.Chrome(executable_path=chromedriver_path, options=chrome_options)
     except Exception as e:
-        logger.exception("Failed to initialize undetected_chromedriver with subprocess.")
+        logger.exception("Error during WebDriver initialization.")
         return None, None
 
     try:
