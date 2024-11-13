@@ -684,7 +684,7 @@ def summarize_text(task_params: Dict[str, Any], cache: Any = None) -> Dict[str, 
         return {"error": "No question provided for summarization."}
 
     prompt = (
-        "Provide a summary of the following text, focusing especially on relevant details for answering the given question. "
+        "Provide a summary of the following text, focusing especially on relevant details for answering the given question. Specifically, mention the publication date when known and the source of the information.\n\n"
         "Be detailed and specific on suppliers, products, capabilities, dates, and other key details such as strategy and vision.\n\n"
         "Do not include any introductions, comments about the summarization process, or closing remarks.\n\n"
         f"Question:\n{question}\n\nText:\n{text}\n\nSummary:"
@@ -982,7 +982,7 @@ def generate_subquestions(task_params: Dict[str, Any], cache: Any = None) -> Dic
 
     description = (
         "Analyze the following question and decompose it into multiple smaller, specific sub-questions "
-        "that cover all aspects necessary to comprehensively answer the main question. "
+        "that cover all aspects necessary to comprehensively answer the main question. Avoid vague or overly broad sub-questions. "
         "Ensure that the combination of answers to these sub-questions will fully answer the main question.\n\n"
         "Return ONLY a JSON object with one key: 'subquestions', which is a list of strings.\n"
         "Do not include any additional text, explanations, or code blocks. Ensure the JSON is properly formatted.\n\n"

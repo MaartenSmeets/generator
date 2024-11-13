@@ -858,23 +858,35 @@ def main():
                     processor.process_question(question_id)
             else:
                 # Define the main question
-                question_text = """**Objective**: Create an elaborate complete markdown report detailing advancements in artificial intelligence only in November 2024, covering hardware, software, open-source developments and emerging trends (focus multiple large companies have shown recently) from reputable and credible sources. Ensure the report highlights recent trends and innovations that reflect the latest industry shifts and focus areas. Each statement should include online references to credible sources. Structure the report to appeal to a broad audience, including both technical and strategic stakeholders. Each section should be engaging, visual, and supported by concrete data from authoritative sources, preferably the official announcements, technical documentation, or product pages of the service providers or manufacturers.
-                    **AI Hardware Advancements**: 
-                    - Present major updates in AI-specific hardware, focusing on recent breakthroughs and trends:
-                        - Summarize upcoming releases or breakthroughs (e.g., new NVIDIA GPUs, Apple’s chips, advancements in edge AI hardware).
-                        - Provide performance comparisons to previous models to highlight improvements, efficiency gains, or scalability enhancements.
-                        - Include new use cases or efficiency gains expected from these advancements, and discuss how they reflect recent industry trends.
-                    **Software Innovations**: 
-                    - Outline cutting-edge software models and updates, including popular trends in AI applications:
-                        - Detail improvements in reasoning, multimodal capabilities, and efficiency with models like OpenAI’s GPT, Meta’s Llama, Google’s Gemini, and others that are driving new AI capabilities.
-                        - Emphasize recent developments in responsible AI, ethical AI practices, and any alignment improvements in popular models.
-                        - Include relevant benchmarks, unique features (such as increased context windows, enhanced image/video processing), and visual comparisons, highlighting recent improvements and trends.
-                    **Open-Source Contributions**: 
-                    - Showcase significant open-source AI releases, focusing on recent contributions and trends. Consider for example new open models and AI related frameworks. Consider LLMs and image generation models and other types when applicable.:
-                        - Highlight contributions from companies like Meta, Microsoft, Google, and others, explaining the anticipated impact and what is innovative about these tools.
-                        - Include real-world applications and potential impact, particularly in underrepresented regions or for solving specific societal challenges, showcasing the relevance to current global AI trends.
-                    **Validation and Accuracy**: 
-                    - Ensure all data points are accurate, verified, and from reputable sources. Avoid unverified claims by cross-referencing with multiple credible sources, primarily direct statements from the companies or technical documentation.
+                question_text = """**Objective**: Generate a comprehensive markdown report detailing advancements in artificial intelligence specifically from November 2024. The report should cover recent updates in hardware developments, software innovations, open-source contributions, and emerging trends, focusing on recent activities by major companies. Information should be derived from online sources such as official announcements, industry news, and product pages. Each statement should include references to reputable, accessible sources. Structure the report to appeal to a broad audience, including both technical and strategic stakeholders, ensuring each section is clear and engaging.
+
+### **AI Hardware Advancements**
+
+- **Notable Hardware Announcements**:
+  - Summarize new AI-specific hardware updates or product announcements from November 2024, focusing on major players like NVIDIA, Apple, Google, or AMD.
+  - Outline general advancements, such as improved processing power, support for edge computing, or enhanced energy efficiency, without requiring detailed benchmark data.
+  - Briefly discuss anticipated use cases or the significance of these hardware updates within the AI industry, especially in supporting applications like generative AI or machine learning at scale.
+
+### **Software Innovations**
+
+- **New AI Model Releases and Capabilities**:
+  - Highlight major model updates or new AI applications introduced in November 2024 by companies like OpenAI, Meta, Google, or Microsoft.
+  - Focus on improvements in model capabilities, such as better reasoning, multimodal processing, or enhanced efficiency. Include examples of notable AI models (e.g., new versions of GPT, Llama, Gemini).
+  - Mention any efforts toward responsible or ethical AI practices from these companies, such as alignment with ethical guidelines, transparency, or bias mitigation.
+
+### **Open-Source Contributions**
+
+- **Recent Open-Source AI Projects**:
+  - Showcase significant open-source AI releases from companies or research groups in November 2024, especially by major contributors like Meta, Microsoft, and Google.
+  - Describe new open-source models, frameworks, or tools, focusing on the potential applications and contributions to industry-wide trends, such as democratizing AI tools or advancing language, video and image generation capabilities.
+  - Include mentions of how these contributions address specific challenges or opportunities within AI, such as making advanced AI accessible to diverse user groups.
+
+### **Validation and Accuracy**
+
+- **Data Verification**:
+  - Ensure that all included information is from reliable sources, such as official announcements, reputable news outlets, or directly from company websites.
+  - Focus on summarizing broadly reported information rather than in-depth technical performance data or proprietary insights.
+  - Cross-reference sources when possible to increase reliability and avoid unverified claims.
                 """
                 logger.info(f"Main question: {question_text}")
 
