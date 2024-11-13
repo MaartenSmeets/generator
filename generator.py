@@ -371,9 +371,13 @@ class QuestionProcessor:
 
         # If we have exceeded max attempts, stop processing
         if attempts >= MAX_ATTEMPTS:
-            logger.warning(f"Max attempts reached for question ID {question_id}.")
-            database.update_question_status(self.conn, question_id, 'unanswerable')
-            return None
+            if not self.has_pending_tasks_or_subquestions(question_id):
+                logger.warning(f"Max attempts reached for question ID {question_id} with no pending tasks or subquestions.")
+                database.update_question_status(self.conn, question_id, 'unanswerable')
+                return None
+            else:
+                logger.debug("Max attempts reached but there are still pending tasks or subquestions.")
+                return None
 
         # Determine the current depth of the question
         current_depth = self.get_question_depth(question_id)
@@ -394,15 +398,22 @@ class QuestionProcessor:
                     database.update_question_status(self.conn, question_id, 'answered', answer_text)
                     return answer_text
                 elif is_unanswerable:
-                    logger.info("Answer indicates the question is unanswerable.")
-                    database.update_question_status(self.conn, question_id, 'unanswerable')
-                    return None
+                    if not self.has_pending_tasks_or_subquestions(question_id):
+                        logger.info("Answer indicates the question is unanswerable with no pending tasks or subquestions.")
+                        database.update_question_status(self.conn, question_id, 'unanswerable')
+                        return None
+                    else:
+                        logger.debug("Answer indicates unanswerable but there are pending tasks or subquestions. Not marking as unanswerable.")
+                        return None
                 else:
                     database.update_question_status(self.conn, question_id, 'answered', answer_text)
                     return answer_text
 
             logger.debug("Unable to generate answer at maximum depth.")
-            database.update_question_status(self.conn, question_id, 'unanswerable')
+            if not self.has_pending_tasks_or_subquestions(question_id):
+                database.update_question_status(self.conn, question_id, 'unanswerable')
+            else:
+                logger.debug("But there are pending tasks or subquestions, not marking as unanswerable.")
             return None
 
         # Step 1: Extract keywords from the question if not already done
@@ -410,7 +421,8 @@ class QuestionProcessor:
             keywords = self.extract_keywords(question_id, question_text)
             if keywords is None:
                 logger.error("Failed to extract keywords.")
-                database.update_question_status(self.conn, question_id, 'unanswerable')
+                if not self.has_pending_tasks_or_subquestions(question_id):
+                    database.update_question_status(self.conn, question_id, 'unanswerable')
                 return None
             logger.debug(f"Extracted keywords: {keywords}")
         else:
@@ -500,9 +512,13 @@ class QuestionProcessor:
                     return self.process_question(question_id, attempts=attempts + 1)
                 elif not answer_text and not missing_information:
                     # Handle the case where both answer and missing_information are empty
-                    logger.info("No answer or missing information provided. Marking question as unanswerable.")
-                    database.update_question_status(self.conn, question_id, 'unanswerable')
-                    return None
+                    if not self.has_pending_tasks_or_subquestions(question_id):
+                        logger.info("No answer or missing information provided and no pending tasks or subquestions. Marking question as unanswerable.")
+                        database.update_question_status(self.conn, question_id, 'unanswerable')
+                        return None
+                    else:
+                        logger.debug("No answer or missing information but there are pending tasks or subquestions. Not marking as unanswerable.")
+                        return None
                 else:
                     # Validate if the answer indicates unanswerable
                     is_unanswerable = self.validate_answer(question_id, question_text, answer_text)
@@ -511,9 +527,13 @@ class QuestionProcessor:
                         database.update_question_status(self.conn, question_id, 'answered', answer_text)
                         return answer_text
                     elif is_unanswerable:
-                        logger.info("Answer indicates the question is unanswerable.")
-                        database.update_question_status(self.conn, question_id, 'unanswerable')
-                        return None
+                        if not self.has_pending_tasks_or_subquestions(question_id):
+                            logger.info("Answer indicates the question is unanswerable with no pending tasks or subquestions.")
+                            database.update_question_status(self.conn, question_id, 'unanswerable')
+                            return None
+                        else:
+                            logger.debug("Answer indicates unanswerable but there are pending tasks or subquestions. Not marking as unanswerable.")
+                            return None
                     else:
                         database.update_question_status(self.conn, question_id, 'answered', answer_text)
                         return answer_text
@@ -544,41 +564,49 @@ class QuestionProcessor:
                     sub_question_text = cursor.fetchone()[0]
                     sub_answers.append(f"Could not find an answer to sub-question: {sub_question_text}")
 
-                # After processing tasks and/or subquestions, attempt to generate an answer using the collected information
-                combined_context = self.collect_context(question_id)
-                answer_result = self.answer_generator.generate_answer_from_context(question_text, combined_context)
+            # After processing tasks and/or subquestions, attempt to generate an answer using the collected information
+            combined_context = self.collect_context(question_id)
+            answer_result = self.answer_generator.generate_answer_from_context(question_text, combined_context)
 
-                if answer_result:
-                    answer_text = answer_result.get('answer', '')
-                    missing_information = answer_result.get('missing_information', '')
-                    if missing_information:
-                        # Generate subquestions based on missing information
-                        logger.info(f"Missing information identified: {missing_information}")
-                        # Use missing_information to generate subquestions
-                        sub_questions = self.generate_subquestions_from_missing_information(question_id, missing_information)
-                        # Save subquestions in the database
-                        for sub_question_text in sub_questions:
-                            self.get_or_create_subquestion(sub_question_text, question_id)
-                        # Re-process the question after adding subquestions
-                        return self.process_question(question_id, attempts=attempts + 1)
-                    elif answer_text:
-                        # Validate if the answer indicates unanswerable
-                        is_unanswerable = self.validate_answer(question_id, question_text, answer_text)
-                        if is_unanswerable is None:
-                            logger.error("Failed to validate answer. Proceeding with the available answer.")
-                            database.update_question_status(self.conn, question_id, 'answered', answer_text)
-                            return answer_text
-                        elif is_unanswerable:
-                            logger.info("Answer indicates the question is unanswerable.")
+            if answer_result:
+                answer_text = answer_result.get('answer', '')
+                missing_information = answer_result.get('missing_information', '')
+                if missing_information:
+                    # Generate subquestions based on missing information
+                    logger.info(f"Missing information identified: {missing_information}")
+                    # Use missing_information to generate subquestions
+                    sub_questions = self.generate_subquestions_from_missing_information(question_id, missing_information)
+                    # Save subquestions in the database
+                    for sub_question_text in sub_questions:
+                        self.get_or_create_subquestion(sub_question_text, question_id)
+                    # Re-process the question after adding subquestions
+                    return self.process_question(question_id, attempts=attempts + 1)
+                elif answer_text:
+                    # Validate if the answer indicates unanswerable
+                    is_unanswerable = self.validate_answer(question_id, question_text, answer_text)
+                    if is_unanswerable is None:
+                        logger.error("Failed to validate answer. Proceeding with the available answer.")
+                        database.update_question_status(self.conn, question_id, 'answered', answer_text)
+                        return answer_text
+                    elif is_unanswerable:
+                        if not self.has_pending_tasks_or_subquestions(question_id):
+                            logger.info("Answer indicates the question is unanswerable with no pending tasks or subquestions.")
                             database.update_question_status(self.conn, question_id, 'unanswerable')
                             return None
                         else:
-                            database.update_question_status(self.conn, question_id, 'answered', answer_text)
-                            return answer_text
+                            logger.debug("Answer indicates unanswerable but there are pending tasks or subquestions. Not marking as unanswerable.")
+                            return None
                     else:
-                        # Handle the case where both answer and missing_information are empty
-                        logger.info("No answer or missing information provided. Marking question as unanswerable.")
+                        database.update_question_status(self.conn, question_id, 'answered', answer_text)
+                        return answer_text
+                else:
+                    # Handle the case where both answer and missing_information are empty
+                    if not self.has_pending_tasks_or_subquestions(question_id):
+                        logger.info("No answer or missing information provided and no pending tasks or subquestions. Marking question as unanswerable.")
                         database.update_question_status(self.conn, question_id, 'unanswerable')
+                        return None
+                    else:
+                        logger.debug("No answer or missing information but there are pending tasks or subquestions. Not marking as unanswerable.")
                         return None
             else:
                 # Handle the case where answer generation failed
@@ -595,7 +623,8 @@ class QuestionProcessor:
                             database.update_question_status(self.conn, question_id, 'answered', partial_answer)
                             return partial_answer
                         else:
-                            database.update_question_status(self.conn, question_id, 'unanswerable')
+                            if not self.has_pending_tasks_or_subquestions(question_id):
+                                database.update_question_status(self.conn, question_id, 'unanswerable')
                             return None
                 else:
                     logger.debug("There are still pending tasks or subquestions.")
